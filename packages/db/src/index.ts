@@ -15,6 +15,7 @@
 
 export { prisma } from "./client";
 export { logAudit, type LogAuditInput, type AuditActorType } from "./audit";
+export { sha256Hex, bodyHash } from "./hash";
 export {
   verifyAuditChain,
   type ChainBreak,
@@ -50,7 +51,10 @@ export {
   MatterTaskStatus,
   MatterFieldType,
   LegalHoldStatus,
-  PreservationDataSource,
+  DataSourceType,
+  PreservationAction,
+  LegalHoldEventType,
+  AgentApprovalStatus,
   IntakeSource,
   IntakeStatus,
   AgentRecommendationStatus,
@@ -90,9 +94,15 @@ export type {
   MatterFieldTemplate,
   MatterTypeConfig,
   LegalHold,
-  HoldNotice,
-  HoldAttestation,
-  PreservationOrder,
+  LegalHoldCustodian,
+  CustodianDataSource,
+  HoldNoticeTemplate,
+  HoldNoticeIssuance,
+  LegalHoldEvent,
+  HoldTriggerEvent,
+  OrganizationHoldPolicy,
+  DepartedCustodianRetention,
+  AgentDecision,
   IntakeTicket,
   AgentRecommendation,
   IntakeConversation,
