@@ -464,6 +464,94 @@ export async function exportHoldDefensibility(holdId: string) {
   return LegalHoldServices.exportHoldDefensibilityService(holdId);
 }
 
+// Bulk operations on custodians (4c.3, Item 6)
+export async function bulkMarkAcknowledged(
+  input: import("./src/internal/legal-hold").BulkMarkAcknowledgedInput,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.bulkMarkAcknowledgedService(input, actor);
+}
+export async function bulkReleaseCustodians(
+  input: import("./src/internal/legal-hold").BulkReleaseInput,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.bulkReleaseCustodiansService(input, actor);
+}
+export async function bulkSendReminder(
+  input: import("./src/internal/legal-hold").BulkSendReminderInput,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.bulkSendReminderService(input, actor);
+}
+export type {
+  BulkMarkAcknowledgedInput,
+  BulkReleaseInput,
+  BulkSendReminderInput,
+  BulkOutcomeRow,
+  BulkResult,
+} from "./src/internal/legal-hold";
+
+// Admin-on-behalf acknowledgment (4c.3, Item 2)
+export async function markCustodianAcknowledgedByAdmin(
+  input: import("./src/internal/legal-hold").MarkAcknowledgedInput,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.markCustodianAcknowledgedByAdminService(
+    input,
+    actor,
+  );
+}
+export type { MarkAcknowledgedInput } from "./src/internal/legal-hold";
+
+// Notice viewer drill-in (4c.3, Item 7)
+export async function getNoticeIssuanceForViewer(
+  holdId: string,
+  issuanceId: string,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.getNoticeIssuanceForViewerService(
+    holdId,
+    issuanceId,
+    actor,
+  );
+}
+export type { NoticeIssuanceForViewer } from "./src/internal/legal-hold";
+
+// Notice composer (4c.3)
+export async function getNoticeComposerPreview(
+  input: import("./src/internal/legal-hold").ComposerPreviewInput,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.getNoticeComposerPreviewService(input, actor);
+}
+export async function composeAndSendNotice(
+  input: import("./src/internal/legal-hold").ComposeAndSendInput,
+  actor: import("./src/internal/legal-hold").HoldActor,
+) {
+  return LegalHoldServices.composeAndSendNoticeService(input, actor);
+}
+export { renderTemplate } from "./src/internal/legal-hold";
+export type {
+  ComposerPreviewInput,
+  ComposerPreviewResult,
+  ComposeAndSendInput,
+  ComposeAndSendResult,
+  NoticeComposerVariables,
+} from "./src/internal/legal-hold";
+
+// Actor resolution for timelines, audit views, and notice "issued by".
+export async function resolveActors(
+  organizationId: string,
+  inputs: Array<{ actorId: string | null; actorType: string }>,
+) {
+  return LegalHoldServices.resolveActorsService(organizationId, inputs);
+}
+export { actorKey } from "./src/internal/legal-hold";
+export type {
+  ActorKind,
+  ResolvedActor,
+} from "./src/internal/legal-hold";
+
 // AI mock client (sunset 4d)
 export { getHoldAIClient } from "./src/internal/legal-hold";
 

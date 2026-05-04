@@ -43,6 +43,42 @@ export {
   updateNoticeTemplateService,
 } from "./services/notice-template";
 
+// Bulk operations on custodians (4c.3, Item 6)
+export {
+  bulkMarkAcknowledgedService,
+  bulkReleaseCustodiansService,
+  bulkSendReminderService,
+  type BulkMarkAcknowledgedInput,
+  type BulkReleaseInput,
+  type BulkSendReminderInput,
+  type BulkOutcomeRow,
+  type BulkResult,
+} from "./services/bulk";
+
+// Admin-on-behalf acknowledgment (4c.3, Item 2)
+export {
+  markCustodianAcknowledgedByAdminService,
+  type MarkAcknowledgedInput,
+} from "./services/acknowledgment";
+
+// Notice viewer drill-in (4c.3, Item 7)
+export {
+  getNoticeIssuanceForViewerService,
+  type NoticeIssuanceForViewer,
+} from "./services/notice-viewer";
+
+// Notice composer (4c.3)
+export {
+  composeAndSendNoticeService,
+  getNoticeComposerPreviewService,
+  renderTemplate,
+  type ComposerPreviewInput,
+  type ComposerPreviewResult,
+  type ComposeAndSendInput,
+  type ComposeAndSendResult,
+  type NoticeComposerVariables,
+} from "./services/notice-composer";
+
 // Policy
 export {
   effectiveCadenceDays,
@@ -76,6 +112,14 @@ export {
   listLegalHoldsService,
   type HoldWorkspaceSummary,
 } from "./services/reads";
+
+// Actor resolution (timeline + audit + notice "issued by")
+export {
+  actorKey,
+  resolveActorsService,
+  type ActorKind,
+  type ResolvedActor,
+} from "./services/actor-resolver";
 
 // Errors / sentinels
 export { AgentDecisionPendingError } from "./services/timeline";
