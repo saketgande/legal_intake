@@ -114,8 +114,41 @@ export {
 } from "./services/reminders";
 export { decideEscalation, type EscalationDecision } from "./services/escalation";
 
+// Notice template version history (4c.5, Item 17)
+export {
+  getTemplateVersionByNumberService,
+  listTemplateVersionsService,
+  saveTemplateVersionService,
+  type SaveTemplateVersionInput,
+  type VersionDTO,
+} from "./services/notice-template-versions";
+
+// Saved views (4c.5, Item 16)
+export {
+  createSavedViewService,
+  deleteSavedViewService,
+  listSavedViewsService,
+  updateSavedViewService,
+  type CreateSavedViewInput,
+  type SavedViewDTO,
+  type UpdateSavedViewInput,
+} from "./services/saved-views";
+
 // Defensibility
 export { getHoldDefensibilityScoreService } from "./services/defensibility";
+export {
+  isoWeek,
+  listHoldSnapshotsService,
+  pruneOldSnapshotsService,
+  recordDefensibilitySnapshotService,
+  type HoldSnapshotDTO,
+  type ListSnapshotsOptions,
+} from "./services/defensibility-snapshot";
+export {
+  runDailySnapshotPass,
+  runWeeklyCleanupPass,
+  type DailySnapshotPassResult,
+} from "./services/snapshot-jobs";
 export {
   exportHoldDefensibilityService,
   type HoldDefensibilityExport,

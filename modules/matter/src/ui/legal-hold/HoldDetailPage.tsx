@@ -32,6 +32,7 @@ import { TriggerEventDialog } from "./TriggerEventDialog";
 import { IssueHoldConfirmDialog } from "./IssueHoldConfirmDialog";
 import { ReleaseHoldConfirmDialog } from "./ReleaseHoldConfirmDialog";
 import { JurisdictionPolicyPopover } from "./JurisdictionPolicyPopover";
+import { DefensibilityTrendModal } from "./DefensibilityTrendModal";
 import type {
   HoldDefensibilityScoreDTO,
   HoldEventDTO,
@@ -52,23 +53,34 @@ export interface HoldDetailPageProps {
  * stable interface that survives the auth SDK swap.
  */
 function useHoldPermissions() {
-  const [perms, setPerms] = useState<Set<string>>(new Set());
+  const [state, setState] = useState<{
+    perms: Set<string>;
+    userId: string | null;
+  }>({ perms: new Set(), userId: null });
   useEffect(() => {
     let alive = true;
     fetch("/api/auth/current-user", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
-      .then((d: { user?: { permissions?: string[] } } | null) => {
-        if (!alive) return;
-        setPerms(new Set(d?.user?.permissions ?? []));
-      })
+      .then(
+        (d: {
+          user?: { id?: string; permissions?: string[] };
+        } | null) => {
+          if (!alive) return;
+          setState({
+            perms: new Set(d?.user?.permissions ?? []),
+            userId: d?.user?.id ?? null,
+          });
+        },
+      )
       .catch(() => undefined);
     return () => {
       alive = false;
     };
   }, []);
   return {
-    canIssue: perms.has("matter:legal_hold:issue"),
-    canRelease: perms.has("matter:legal_hold:release"),
+    canIssue: state.perms.has("matter:legal_hold:issue"),
+    canRelease: state.perms.has("matter:legal_hold:release"),
+    userId: state.userId,
   };
 }
 
@@ -95,7 +107,7 @@ export const HoldDetailPage: React.FC<HoldDetailPageProps> = ({
 }) => {
   const baseUrl = `${endpoint}/${matterId}/holds/${holdId}`;
   const wide = useIsWide(1024);
-  const { canIssue, canRelease } = useHoldPermissions();
+  const { canIssue, canRelease, userId } = useHoldPermissions();
 
   const [summary, setSummary] = useState<HoldWorkspaceSummaryDTO | null>(null);
   const [score, setScore] = useState<HoldDefensibilityScoreDTO | null>(null);
@@ -115,6 +127,10 @@ export const HoldDetailPage: React.FC<HoldDetailPageProps> = ({
   const [issueDialogOpen, setIssueDialogOpen] = useState(false);
   const [releaseDialogOpen, setReleaseDialogOpen] = useState(false);
   const [jurPopoverCode, setJurPopoverCode] = useState<string | null>(null);
+  const [trendOpen, setTrendOpen] = useState(false);
+  const [snapshots, setSnapshots] = useState<
+    Array<{ computedAt: string; score: number }>
+  >([]);
   // Custodian roster for the Issue dialog's preview list — fetched
   // lazily only when the dialog opens to keep the workspace mount
   // round-trip cheap.
@@ -144,6 +160,14 @@ export const HoldDetailPage: React.FC<HoldDetailPageProps> = ({
         setTriggerLoaded(true);
       })
       .catch(() => alive && setTriggerLoaded(true));
+    // Sparkline source — last 30 snapshots, oldest-first.
+    fetch(`${baseUrl}/snapshots?limit=30`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`)))
+      .then(
+        (rows: Array<{ computedAt: string; score: number }>) =>
+          alive && setSnapshots(rows),
+      )
+      .catch(() => alive && setSnapshots([]));
     return () => {
       alive = false;
     };
@@ -259,6 +283,11 @@ export const HoldDetailPage: React.FC<HoldDetailPageProps> = ({
         hasTriggerEvent={triggerLoaded ? !!trigger : true}
         onEditTrigger={canIssue ? () => setTriggerDialogOpen(true) : undefined}
         onClickJurisdiction={(code) => setJurPopoverCode(code)}
+        snapshotPoints={snapshots.map((s) => ({
+          label: s.computedAt.slice(0, 10),
+          value: s.score,
+        }))}
+        onOpenTrend={() => setTrendOpen(true)}
       />
 
       <HoldStatusRow
@@ -340,6 +369,14 @@ export const HoldDetailPage: React.FC<HoldDetailPageProps> = ({
         />
       )}
 
+      {trendOpen && (
+        <DefensibilityTrendModal
+          matterId={matterId}
+          holdId={holdId}
+          onClose={() => setTrendOpen(false)}
+        />
+      )}
+
       {releaseDialogOpen && (
         <ReleaseHoldConfirmDialog
           matterId={matterId}
@@ -373,6 +410,7 @@ export const HoldDetailPage: React.FC<HoldDetailPageProps> = ({
           holdId={holdId}
           canMutate={canIssue}
           canRelease={canRelease}
+          currentUserId={userId}
           onChange={reload}
           onSendReminders={() => {
             // 4c.2 surfaces the affordance; the actual escalation

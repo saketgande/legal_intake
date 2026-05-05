@@ -481,6 +481,91 @@ export async function exportHoldDefensibility(holdId: string) {
   return LegalHoldServices.exportHoldDefensibilityService(holdId);
 }
 
+// Notice template version history (4c.5, Item 17)
+export async function listTemplateVersions(
+  templateId: string,
+  actor: { id: string; organizationId: string },
+) {
+  return LegalHoldServices.listTemplateVersionsService(templateId, actor);
+}
+export async function saveTemplateVersion(
+  input: import("./src/internal/legal-hold").SaveTemplateVersionInput,
+  actor: { id: string; organizationId: string },
+) {
+  return LegalHoldServices.saveTemplateVersionService(input, actor);
+}
+export async function getTemplateVersionByNumber(
+  templateId: string,
+  version: number,
+  actor: { id: string; organizationId: string },
+) {
+  return LegalHoldServices.getTemplateVersionByNumberService(
+    templateId,
+    version,
+    actor,
+  );
+}
+export type {
+  SaveTemplateVersionInput,
+  VersionDTO as TemplateVersionDTO,
+} from "./src/internal/legal-hold";
+
+// Saved views (4c.5, Item 16)
+export async function listSavedViews(
+  actor: { id: string; organizationId: string },
+  scope: import("@aegis/db").SavedViewScope,
+) {
+  return LegalHoldServices.listSavedViewsService(actor, scope);
+}
+export async function createSavedView(
+  input: import("./src/internal/legal-hold").CreateSavedViewInput,
+  actor: { id: string; organizationId: string },
+) {
+  return LegalHoldServices.createSavedViewService(input, actor);
+}
+export async function updateSavedView(
+  input: import("./src/internal/legal-hold").UpdateSavedViewInput,
+  actor: { id: string; organizationId: string },
+) {
+  return LegalHoldServices.updateSavedViewService(input, actor);
+}
+export async function deleteSavedView(
+  viewId: string,
+  actor: { id: string; organizationId: string },
+) {
+  return LegalHoldServices.deleteSavedViewService(viewId, actor);
+}
+export type {
+  CreateSavedViewInput,
+  SavedViewDTO,
+  UpdateSavedViewInput,
+} from "./src/internal/legal-hold";
+
+// Defensibility snapshots (4c.5, Item 15)
+export async function recordDefensibilitySnapshot(holdId: string) {
+  return LegalHoldServices.recordDefensibilitySnapshotService(holdId);
+}
+export async function listHoldSnapshots(
+  holdId: string,
+  opts?: import("./src/internal/legal-hold").ListSnapshotsOptions,
+) {
+  return LegalHoldServices.listHoldSnapshotsService(holdId, opts);
+}
+export async function pruneOldSnapshots(organizationId: string) {
+  return LegalHoldServices.pruneOldSnapshotsService(organizationId);
+}
+export async function runDailySnapshotPass(organizationId: string) {
+  return LegalHoldServices.runDailySnapshotPass(organizationId);
+}
+export async function runWeeklyCleanupPass(organizationId: string) {
+  return LegalHoldServices.runWeeklyCleanupPass(organizationId);
+}
+export type {
+  DailySnapshotPassResult,
+  HoldSnapshotDTO,
+  ListSnapshotsOptions,
+} from "./src/internal/legal-hold";
+
 // Bulk operations on custodians (4c.3, Item 6)
 export async function bulkMarkAcknowledged(
   input: import("./src/internal/legal-hold").BulkMarkAcknowledgedInput,
