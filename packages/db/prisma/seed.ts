@@ -1387,6 +1387,15 @@ async function main() {
     `[seed] roles=${ru.rolesWritten} test_users=${ru.usersWritten}`,
   );
 
+  const ta = await seedTicketAssignments(org.id);
+  console.log(`[seed] ticket_assignments=${ta}`);
+
+  const rr = await seedRoutingRules(org.id);
+  console.log(`[seed] routing_rules=${rr}`);
+
+  const sla = await seedSlaDemoState(org.id);
+  console.log(`[seed] sla_demo_breach_candidates=${sla}`);
+
   console.log("[seed] done.");
 }
 
@@ -1623,6 +1632,165 @@ async function seedTickets(orgId: string) {
   }
 
   return { ticketCount: tickets.length, recCount, convCount, autoPersonCount };
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Section 4b — Typed ticket assignments (P1b)
+// ───────────────────────────────────────────────────────────────────
+//
+// Gives the "My Queue" Inbox filter real data on a fresh demo. Runs
+// after §7 because it references the seeded test users. Two in-flight
+// tickets go to the admin (the demo presenter's session in dev mode)
+// and two to the attorney test user. Both the `assignedToUserId` FK
+// and the display-mirror `assignedTo` free text are written, matching
+// what the Cockpit's reassign picker produces at runtime.
+//
+// Idempotent: plain updates keyed on fixed ticket ids; re-runs
+// rewrite the same values. Skips silently if a ticket id is absent
+// (e.g. fixtures changed) — seed assignment is demo sugar, not a
+// schema invariant.
+
+async function seedTicketAssignments(orgId: string): Promise<number> {
+  const admin = await prisma.user.findFirst({
+    where: { organizationId: orgId, role: { name: "admin" } },
+  });
+  const attorney = await prisma.user.findFirst({
+    where: {
+      organizationId: orgId,
+      email: "lena.attorney@aegis-demo.example",
+    },
+  });
+
+  const assignments: Array<{ ticketId: string; user: typeof admin }> = [
+    // Admin: the in-review contract + the in-flight privacy question,
+    // so "My Queue" has data for the presenter. Deliberately NOT a
+    // Critical ticket — the Critical→GC routing rule (§4c) would
+    // reassign it to the GC on the next save pass.
+    { ticketId: "REQ-3401", user: admin },
+    { ticketId: "REQ-3410", user: admin },
+    // Attorney: the IP question + the escalated employment issue
+    // (the employment routing rule converges to the same assignee).
+    { ticketId: "REQ-3402", user: attorney },
+    { ticketId: "REQ-3403", user: attorney },
+  ];
+
+  let written = 0;
+  for (const a of assignments) {
+    if (!a.user) continue;
+    const res = await prisma.intakeTicket.updateMany({
+      where: { id: a.ticketId, organizationId: orgId },
+      data: { assignedToUserId: a.user.id, assignedTo: a.user.name },
+    });
+    written += res.count;
+  }
+  return written;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Section 4c — Intake routing rules (P2a demo-lite)
+// ───────────────────────────────────────────────────────────────────
+//
+// Four rules exercising every condition + action type. Deterministic
+// ids so re-runs upsert. timesFired counts are demo fixtures (same
+// spirit as the static "matches: 231" the old in-memory rules
+// displayed); live firings increment from here. Runs after §7 — the
+// two assignee actions reference seeded test users.
+
+async function seedRoutingRules(orgId: string): Promise<number> {
+  const gc = await prisma.user.findFirst({
+    where: { organizationId: orgId, email: "marcus.gc@aegis-demo.example" },
+  });
+  const attorney = await prisma.user.findFirst({
+    where: {
+      organizationId: orgId,
+      email: "lena.attorney@aegis-demo.example",
+    },
+  });
+
+  const rules = [
+    {
+      id: "rule-breach-keyword",
+      name: "Data-breach keywords escalate priority",
+      description:
+        'Any request whose description mentions "breach" is treated as Critical before anything else routes.',
+      evalOrder: 5,
+      matchKeyword: "breach",
+      setPriority: "Critical",
+      timesFired: 3,
+    },
+    {
+      id: "rule-critical-gc",
+      name: "Critical priority → GC fast lane",
+      description:
+        "Critical tickets go straight to the General Counsel with a 4-hour SLA.",
+      evalOrder: 10,
+      matchPriority: "Critical",
+      setAssigneeUserId: gc?.id ?? null,
+      setSlaHours: 4,
+      timesFired: 12,
+    },
+    {
+      id: "rule-employment",
+      name: "Employment issues → senior attorney",
+      description:
+        "Employment matters are sensitive — route to the senior employment attorney. (Assignee only: a set-priority action here could downgrade a Critical employment ticket.)",
+      evalOrder: 20,
+      matchType: "Employment Issue",
+      setAssigneeUserId: attorney?.id ?? null,
+      timesFired: 8,
+    },
+    {
+      id: "rule-nda-sla",
+      name: "NDA fast lane (8h SLA)",
+      description:
+        "Standard NDAs are template work — tighten the SLA so they don't sit in the queue.",
+      evalOrder: 30,
+      matchType: "NDA Request",
+      setSlaHours: 8,
+      timesFired: 31,
+    },
+  ];
+
+  let written = 0;
+  for (const r of rules) {
+    const { id, timesFired, ...fields } = r;
+    await prisma.intakeRoutingRule.upsert({
+      where: { id },
+      update: { ...fields },
+      create: {
+        id,
+        organizationId: orgId,
+        timesFired,
+        ...fields,
+      },
+    });
+    written += 1;
+  }
+  return written;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Section 4d — SLA breach-scan demo state (P1c demo-lite)
+// ───────────────────────────────────────────────────────────────────
+//
+// Pushes REQ-3409 (Critical contract review, 8h SLA, fixture age
+// 5.22h) back to 9 hours old so it is past-SLA but NOT yet escalated.
+// The "Run breach scan" button on the SLA Dashboard then has a live
+// target: the scan flips it to ESCALATED and writes the
+// sla_breached / auto_escalated audit pair in front of the audience.
+// REQ-3403 stays the "already escalated" fixture; this one is the
+// "escalates live" fixture.
+
+async function seedSlaDemoState(orgId: string): Promise<number> {
+  const res = await prisma.intakeTicket.updateMany({
+    where: {
+      id: "REQ-3409",
+      organizationId: orgId,
+      status: { notIn: [IntakeStatus.ESCALATED] },
+    },
+    data: { submittedAt: new Date(Date.now() - 9 * 3600 * 1000) },
+  });
+  return res.count;
 }
 
 // ───────────────────────────────────────────────────────────────────
