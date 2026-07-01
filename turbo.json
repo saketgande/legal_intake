@@ -1,0 +1,78 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": [
+    "**/.env.*local",
+    "tsconfig.base.json"
+  ],
+  "globalEnv": [
+    "NODE_ENV",
+    "VERCEL_ENV"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "env": [
+        "ANTHROPIC_API_KEY",
+        "DATABASE_URL",
+        "AUTH0_SECRET",
+        "AUTH0_BASE_URL",
+        "AUTH0_ISSUER_BASE_URL",
+        "AUTH0_CLIENT_ID",
+        "AUTH0_CLIENT_SECRET",
+        "DEV_USER_EMAIL",
+        "SEED_ADMIN_EMAIL"
+      ],
+      "outputs": [
+        ".next/**",
+        "!.next/cache/**",
+        "dist/**"
+      ]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "env": [
+        "ANTHROPIC_API_KEY",
+        "DATABASE_URL",
+        "AUTH0_SECRET",
+        "AUTH0_BASE_URL",
+        "AUTH0_ISSUER_BASE_URL",
+        "AUTH0_CLIENT_ID",
+        "AUTH0_CLIENT_SECRET",
+        "DEV_USER_EMAIL",
+        "SEED_ADMIN_EMAIL"
+      ]
+    },
+    "lint": {
+      "dependsOn": ["^lint"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^test"],
+      "env": [
+        "DATABASE_URL"
+      ],
+      "outputs": ["coverage/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"],
+      "outputs": []
+    },
+    "db:generate": {
+      "cache": false,
+      "outputs": ["src/generated/**"]
+    },
+    "db:migrate": {
+      "cache": false,
+      "env": ["DATABASE_URL"],
+      "outputs": ["prisma/migrations/**"]
+    },
+    "db:seed": {
+      "cache": false,
+      "env": ["DATABASE_URL", "SEED_ADMIN_EMAIL"]
+    },
+    "clean": {
+      "cache": false
+    }
+  }
+}

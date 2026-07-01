@@ -1,0 +1,1884 @@
+// AEGIS — Prisma schema
+// =====================
+//
+// One schema, all 11 modules. Modules attach to shared entities
+// (Counterparty, Person, Document, Obligation, Event, Tag) — they do not
+// re-implement them. This file is the architectural backbone of
+// Differentiator #1 (one brain across legal operations).
+//
+// Provider: PostgreSQL (local dev via docker-compose; prod via Neon).
+// Migrations live in prisma/migrations/. The generated client is emitted
+// to node_modules/@prisma/client.
+//
+// Sections (in order of dependency):
+//   1. Generator + datasource
+//   2. Shared platform — Organization, User, Role, AuditLog, Notification
+//   3. First-class shared entities — Counterparty, Person, Document,
+//      Obligation, Event, Tag, Tagging
+//   4. Matter Management — incl. Legal Hold sub-domain
+//   5. Legal Intake
+//   6. Spend & Counsel
+//   7. Privacy & Compliance Operations
+//   8. UserPreference — KV for UI prefs (cockpit state, agent settings)
+
+// ════════════════════════════════════════════════════════════════════
+// 1. Generator + datasource
+// ════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider      = "prisma-client-js"
+  // Vercel's Lambda runtime is RHEL-based with OpenSSL 3.0; without
+  // this target, prisma generate emits only the host's native binary
+  // (e.g. debian on a developer Mac/Linux laptop, alpine in Docker)
+  // and the production deploy 500s with PrismaClientInitializationError
+  // ("could not locate the Query Engine for runtime rhel-openssl-3.0.x").
+  // Both targets are bundled — `native` keeps `pnpm dev` fast on the
+  // host platform, `rhel-openssl-3.0.x` ships in the serverless bundle.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 2. Shared platform
+// ════════════════════════════════════════════════════════════════════
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  tier      String   @default("DEMO")
+  region    String   @default("US")
+  createdAt DateTime @default(now())
+
+  users          User[]
+  roles          Role[]
+  auditLogs      AuditLog[]
+  notifications  Notification[]
+  counterparties Counterparty[]
+  persons        Person[]
+  documents      Document[]
+  obligations    Obligation[]
+  events         Event[]
+  tags           Tag[]
+  matters        Matter[]
+  legalHolds     LegalHold[]
+  intakeTickets  IntakeTicket[]
+  intakeRoutingRules IntakeRoutingRule[]
+  intakeEmailMailboxes IntakeEmailMailbox[]
+  vendors        Vendor[]
+  budgets        Budget[]
+  dsars          DataSubjectRequest[]
+  consents       ConsentRecord[]
+  ropas          DataProcessingActivity[]
+  incidents      PrivacyIncident[]
+
+  holdPolicy          OrganizationHoldPolicy?
+  holdNoticeTemplates HoldNoticeTemplate[]
+  holdScopeTemplates  HoldScopeTemplate[]
+  savedViews          SavedView[]
+  departedRetentions  DepartedCustodianRetention[]
+  agentDecisions      AgentDecision[]
+  m365Credential      OrganizationM365Credential?
+  m365DeviceCodeSessions M365DeviceCodeSession[]
+
+  @@index([name])
+}
+
+model Role {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  permissions    Json     @default("[]")
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  users        User[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model User {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String
+  name           String
+  roleId         String?
+  lastLoginAt    DateTime?
+  /// Set when an admin suspends the user. Soft delete: the User row
+  /// stays so AuditLog references stay resolvable (actorId), but
+  /// getResolvedUser refuses to return suspended users so they cannot
+  /// authenticate. Cleared by reactivation.
+  suspendedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  role         Role?            @relation(fields: [roleId], references: [id], onDelete: SetNull)
+  persons      Person[]
+  preferences  UserPreference[]
+
+  intakeTicketsAssigned         IntakeTicket[]        @relation("IntakeTicketAssignee")
+  intakeRoutingRulesAssigned    IntakeRoutingRule[]   @relation("IntakeRoutingRuleAssignee")
+  legalHoldsCreated             LegalHold[]           @relation("LegalHoldCreatedBy")
+  legalHoldsReleased            LegalHold[]           @relation("LegalHoldReleasedBy")
+  legalHoldEvents               LegalHoldEvent[]      @relation("LegalHoldEventActor")
+  legalHoldTriggersRecorded     HoldTriggerEvent[]    @relation("HoldTriggerRecordedBy")
+  noticeIssuancesIssued         HoldNoticeIssuance[]  @relation("HoldNoticeIssuedBy")
+  custodianDataSourcesConfirmed CustodianDataSource[] @relation("CustodianDataSourceConfirmedBy")
+  agentDecisionsApproved        AgentDecision[]       @relation("AgentDecisionApprovedBy")
+  holdScopeTemplatesCreated     HoldScopeTemplate[]   @relation("HoldScopeTemplateCreatedBy")
+  savedViews                    SavedView[]                 @relation("SavedViewOwner")
+  noticeTemplateVersions        HoldNoticeTemplateVersion[] @relation("HoldNoticeTemplateVersionCreatedBy")
+  m365DeviceCodeSessions        M365DeviceCodeSession[]     @relation("M365DeviceCodeSessionInitiator")
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+  @@index([roleId])
+}
+
+/// Append-only ledger of every state-changing action across the platform.
+/// Differentiator #3 (D11): every AI action that mutates state writes here.
+/// Modules MUST call logAudit() from @aegis/db on every mutation.
+///
+/// Cryptographic chain (added in Step 4a):
+///   - chainPosition is a per-organization 1-indexed monotonic counter.
+///   - contentHash is SHA-256 over the canonical JSON of the row's
+///     identifying fields plus prevHash (so the chain is hash-linked).
+///   - prevHash references the immediately preceding row's contentHash
+///     within the same organization. The genesis row uses 64 zero-bytes.
+///   - schemaVersion lets us evolve the canonical-JSON shape without
+///     invalidating historical chain validation.
+///
+/// Postgres triggers (see migration 4a-audit-chain) enforce immutability:
+/// UPDATE and DELETE on this table raise an exception. INSERTs flow
+/// through a BEFORE INSERT trigger that computes prevHash, chainPosition,
+/// and contentHash inside a per-organization advisory lock.
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  actorId        String? // null = system / non-user actor (agents, scheduler)
+  actorType      String   @default("USER") // USER | AGENT | SYSTEM
+  action         String // dot.notation: matter.created, intake.recommendation.approved, …
+  resourceType   String // polymorphic — Matter, IntakeTicket, etc.
+  resourceId     String
+  beforeJson     Json?
+  afterJson      Json?
+  metadata       Json? // free-form context (ip, request id, agent confidence, …)
+  timestamp      DateTime @default(now())
+
+  /// SHA-256 hex of the previous row's contentHash within this organization.
+  /// 64 zero-bytes for the genesis row. Filled by BEFORE INSERT trigger.
+  prevHash      String @default("")
+  /// SHA-256 hex of this row's canonical content (excluding contentHash itself).
+  /// Filled by BEFORE INSERT trigger.
+  contentHash   String @default("")
+  /// Per-organization monotonically increasing chain position.
+  /// Filled by BEFORE INSERT trigger.
+  chainPosition BigInt @default(0)
+  /// Canonical-JSON schema version. Bumped if the field set shifts.
+  schemaVersion Int    @default(1)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  legalHoldEvents LegalHoldEvent[] @relation("LegalHoldEventAuditLog")
+  agentDecisions  AgentDecision[]  @relation("AgentDecisionAuditLog")
+
+  @@unique([organizationId, chainPosition])
+  @@index([organizationId, timestamp(sort: Desc)])
+  @@index([organizationId, resourceType, resourceId])
+  @@index([organizationId, actorId])
+  @@index([organizationId, action])
+}
+
+model Notification {
+  id             String    @id @default(cuid())
+  organizationId String
+  recipientId    String // User id
+  type           String // dot.notation: hold.notice.sent, intake.escalation, …
+  payload        Json      @default("{}")
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, recipientId, readAt])
+  @@index([organizationId, createdAt(sort: Desc)])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 3. First-class shared entities
+// ════════════════════════════════════════════════════════════════════
+//
+// Every module attaches to these. They are NOT re-implemented inside
+// modules. New module-specific party / contact / file tables that
+// duplicate these entities are explicitly disallowed (PRODUCT.md).
+
+enum CounterpartyType {
+  COMPANY
+  INDIVIDUAL
+  LAW_FIRM
+  REGULATOR
+  OTHER
+}
+
+model Counterparty {
+  id                  String           @id @default(cuid())
+  organizationId      String
+  name                String
+  type                CounterpartyType
+  country             String?
+  parentId            String? // entity-group hierarchy
+  sanctionsScreenedAt DateTime?
+  metadata            Json             @default("{}")
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  parent       Counterparty?  @relation("CounterpartyHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children     Counterparty[] @relation("CounterpartyHierarchy")
+
+  matters Matter[]
+  vendors Vendor[]
+  // Persons attached to this counterparty as contacts (Person.type = COUNTERPARTY_CONTACT,
+  // metadata.counterpartyId = this id). Not modeled as FK to keep Person polymorphic.
+
+  @@index([organizationId, name])
+  @@index([organizationId, type])
+  @@index([parentId])
+}
+
+enum PersonType {
+  EMPLOYEE
+  EXTERNAL_COUNSEL
+  CUSTODIAN
+  DATA_SUBJECT
+  COUNTERPARTY_CONTACT
+}
+
+/// Polymorphic identity. The same human can be Employee + Custodian
+/// + Data Subject simultaneously — model that as multiple Person rows
+/// linked by externalRef (or via @aegis/identity-graph in Step 7+),
+/// with `type` recording the primary role this row represents.
+model Person {
+  id             String     @id @default(cuid())
+  organizationId String
+  type           PersonType
+  userId         String? // nullable — externals don't have a User
+  externalRef    String? // e.g. workday:E12345 — used for cross-row identity resolution
+  name           String
+  email          String?
+  metadata       Json       @default("{}")
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  matterParties       MatterParty[]
+  legalHoldCustodians LegalHoldCustodian[]
+  departedRetentions  DepartedCustodianRetention[]
+  intakeRequested     IntakeTicket[]               @relation("IntakeRequester")
+  timekeepers         Timekeeper[]
+  invoiceLineItems    InvoiceLineItem[]
+  dsarRequests        DataSubjectRequest[]
+  consentRecords      ConsentRecord[]
+
+  @@index([organizationId, email])
+  @@index([organizationId, externalRef])
+  @@index([organizationId, type])
+  @@index([userId])
+}
+
+enum DocumentOwnerType {
+  MATTER
+  CONTRACT
+  DSAR
+  COMPLIANCE
+  BOARD
+  INTAKE
+}
+
+/// Polymorphic — owner is identified by (ownerType, ownerId). No FK on
+/// owner; @aegis/documents will own the lifecycle and the lookup logic.
+model Document {
+  id               String            @id @default(cuid())
+  organizationId   String
+  name             String
+  mimeType         String
+  sizeBytes        Int
+  storageUrl       String
+  version          Int               @default(1)
+  parentDocumentId String? // versioning: prior version
+  ownerType        DocumentOwnerType
+  ownerId          String
+  uploadedBy       String // User id
+  uploadedAt       DateTime          @default(now())
+  encryptedAt      DateTime?
+  /// Plain-text extraction of the uploaded file (.txt verbatim, .docx
+  /// body text). Demo-grade inline storage: no blob store is wired yet,
+  /// so the agent-readable text lives here. Null until a parser runs.
+  /// Sunset when @aegis/documents adds real blob storage + extraction.
+  extractedText    String?
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  parentDocument Document?    @relation("DocumentVersions", fields: [parentDocumentId], references: [id], onDelete: SetNull)
+  versions       Document[]   @relation("DocumentVersions")
+
+  @@index([organizationId, ownerType, ownerId])
+  @@index([organizationId, uploadedAt(sort: Desc)])
+  @@index([parentDocumentId])
+}
+
+enum ObligationSourceType {
+  CONTRACT
+  REGULATION
+  POLICY
+  PRIVACY_LAW
+}
+
+enum ObligationStatus {
+  OPEN
+  IN_PROGRESS
+  MET
+  BREACHED
+  WAIVED
+}
+
+/// "We owe X to Y by Z." Cuts across Contracts, Regulatory, Privacy,
+/// Governance — anyone with commitments to fulfill or attest to.
+model Obligation {
+  id             String               @id @default(cuid())
+  organizationId String
+  sourceType     ObligationSourceType
+  sourceId       String // polymorphic — Contract id, Regulation id, …
+  description    String
+  dueDate        DateTime?
+  recurrence     String? // RRULE string, or null for one-shot
+  ownerId        String? // Person id (responsible party)
+  status         ObligationStatus     @default(OPEN)
+  metadata       Json                 @default("{}")
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status, dueDate])
+  @@index([organizationId, sourceType, sourceId])
+  @@index([organizationId, ownerId])
+}
+
+/// Append-only event log — feeds Matter timelines, Audit trails,
+/// Notification triggers, Knowledge Management's search index.
+/// Distinct from AuditLog: AuditLog records *who did what* for
+/// compliance; Event records *what happened* for product surfaces.
+model Event {
+  id               String   @id @default(cuid())
+  organizationId   String
+  type             String // dot.notation: matter.opened, hold.attested, …
+  sourceType       String // polymorphic
+  sourceId         String
+  actorId          String? // User id (null for system events)
+  summary          String
+  payload          Json     @default("{}")
+  occurredAt       DateTime @default(now())
+  indexedForSearch Boolean  @default(false)
+
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  matterTimelines MatterTimeline[]
+
+  @@index([organizationId, occurredAt(sort: Desc)])
+  @@index([organizationId, sourceType, sourceId])
+  @@index([organizationId, type])
+  @@index([organizationId, indexedForSearch])
+}
+
+model Tag {
+  id             String @id @default(cuid())
+  organizationId String
+  name           String
+  category       String // e.g. "risk", "domain", "stage"
+  color          String
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  taggings     Tagging[]
+  matterTags   MatterTag[]
+
+  @@unique([organizationId, category, name])
+  @@index([organizationId])
+}
+
+/// Polymorphic many-to-many — Tag attaches to anything by (taggedType, taggedId).
+/// MatterTag is a typed convenience join for Matter; same pattern can be
+/// reproduced per-entity if heavy querying is needed.
+model Tagging {
+  id         String @id @default(cuid())
+  tagId      String
+  taggedType String // polymorphic
+  taggedId   String
+
+  tag Tag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([tagId, taggedType, taggedId])
+  @@index([taggedType, taggedId])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 4. Matter Management — incl. Legal Hold sub-domain
+// ════════════════════════════════════════════════════════════════════
+//
+// Matter is the spine. Intake and Spend depend on it (cross-module API
+// calls in Steps 5 and 6). Legal Hold is a first-class capability of
+// Matter from day one — not a future feature.
+
+enum MatterType {
+  LITIGATION
+  TRANSACTIONAL
+  MA
+  IP
+  EMPLOYMENT
+  REGULATORY
+  INVESTIGATION
+  ADVISORY
+  OTHER
+}
+
+/// Status state machine, enforced in modules/matter:
+///   DRAFT → OPEN → ACTIVE → (STAYED ↔ ACTIVE) → CLOSED → ARCHIVED
+/// CLOSED is gated by the closeout checklist defined on MatterTypeConfig.
+enum MatterStatus {
+  DRAFT
+  OPEN
+  ACTIVE
+  STAYED
+  CLOSED
+  ARCHIVED
+}
+
+model Matter {
+  id                    String       @id @default(cuid())
+  organizationId        String
+  /// Human-readable matter number, unique per organization.
+  /// Format is governed by the org's MatterTypeConfig.numberingFormat.
+  /// Nullable to permit multi-step creation flows (DRAFT before number assignment),
+  /// but in practice every non-DRAFT row carries one.
+  matterNumber          String?
+  title                 String
+  type                  MatterType
+  status                MatterStatus @default(DRAFT)
+  openedAt              DateTime     @default(now())
+  closedAt              DateTime?
+  leadAttorneyId        String? // Person id (Person.type = EMPLOYEE)
+  counterpartyId        String?
+  parentMatterId        String?
+  costCenterId          String?
+  description           String?
+  /// Jurisdiction tag — used by the Litigation FRCP rule engine and reports.
+  /// Free-form to allow non-US codes; recommended values: "US-FED", "US-NY", "EU", …
+  jurisdiction          String?
+  /// Estimated exposure or contract value. Decimal preserves cents precisely.
+  estimatedValue        Decimal?     @db.Decimal(18, 2)
+  /// Estimated duration in days.
+  estimatedDurationDays Int?
+  /// Snapshot of the closeout checklist at matter-creation time. Items
+  /// are { key, label, required, completed, completedAt, completedBy }.
+  /// Sourced from MatterTypeConfig.closeoutChecklist for the matter's type.
+  closeoutChecklistJson Json         @default("[]")
+  /// Type-specific custom fields; keys defined by MatterFieldTemplate rows.
+  customFieldsJson      Json         @default("{}")
+  /// M365 binding metadata. Populated by the (mocked-in-4a, real-in-4c)
+  /// integration: { sharepointSiteId, teamsChannelId, mailFolderId, … }.
+  m365Bindings          Json         @default("{}")
+  metadata              Json         @default("{}")
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  counterparty Counterparty? @relation(fields: [counterpartyId], references: [id], onDelete: SetNull)
+  parent       Matter?       @relation("MatterHierarchy", fields: [parentMatterId], references: [id], onDelete: SetNull)
+  children     Matter[]      @relation("MatterHierarchy")
+
+  parties       MatterParty[]
+  timelines     MatterTimeline[]
+  matterTags    MatterTag[]
+  legalHolds    LegalHold[]
+  invoices      Invoice[]
+  intakeTickets IntakeTicket[]
+  tasks         MatterTask[]
+
+  @@unique([organizationId, matterNumber])
+  @@index([organizationId, status])
+  @@index([organizationId, type])
+  @@index([organizationId, openedAt(sort: Desc)])
+  @@index([counterpartyId])
+  @@index([parentMatterId])
+  @@index([leadAttorneyId])
+}
+
+enum MatterPartyRole {
+  LEAD_ATTORNEY
+  ATTORNEY
+  PARALEGAL
+  OPS_SUPPORT
+  CLIENT_CONTACT
+  CUSTODIAN
+  EXPERT_WITNESS
+  OPPOSING_COUNSEL
+  OTHER
+}
+
+model MatterParty {
+  id       String          @id @default(cuid())
+  matterId String
+  personId String
+  role     MatterPartyRole
+  addedAt  DateTime        @default(now())
+
+  matter Matter @relation(fields: [matterId], references: [id], onDelete: Cascade)
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([matterId, personId, role])
+  @@index([matterId])
+  @@index([personId])
+}
+
+/// Materialized join from Matter to its Events (events are polymorphic;
+/// this gives Matter UI a fast indexed timeline without scanning events).
+model MatterTimeline {
+  id       String @id @default(cuid())
+  matterId String
+  eventId  String
+
+  matter Matter @relation(fields: [matterId], references: [id], onDelete: Cascade)
+  event  Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([matterId, eventId])
+  @@index([matterId])
+}
+
+model MatterTag {
+  id       String @id @default(cuid())
+  matterId String
+  tagId    String
+
+  matter Matter @relation(fields: [matterId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([matterId, tagId])
+  @@index([matterId])
+  @@index([tagId])
+}
+
+enum MatterTaskStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+/// Tasks attached to a matter — checklist items, deadlines, FRCP-derived
+/// dates. dependsOnTaskId implements simple A-blocks-B dependencies; the
+/// scheduler refuses to advance a task whose blocker is not DONE.
+model MatterTask {
+  id              String           @id @default(cuid())
+  matterId        String
+  title           String
+  description     String?
+  assigneeId      String? // Person id (LEAD_ATTORNEY, ATTORNEY, PARALEGAL …)
+  dueDate         DateTime?
+  status          MatterTaskStatus @default(PENDING)
+  /// Source of the task — "manual", "closeout", "frcp:rule-26-disclosures",
+  /// "calendar:statutory", "intake-derived", … . Reporting and the
+  /// closeout-checklist gate read this.
+  source          String           @default("manual")
+  /// Stable key for closeout checklist items (matches the key in
+  /// Matter.closeoutChecklistJson) so completing a task can mark the
+  /// corresponding checklist line item done.
+  closeoutKey     String?
+  dependsOnTaskId String?
+  createdBy       String // User id
+  completedAt     DateTime?
+  completedBy     String? // User id
+  metadata        Json             @default("{}")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  matter        Matter       @relation(fields: [matterId], references: [id], onDelete: Cascade)
+  dependsOnTask MatterTask?  @relation("MatterTaskDependency", fields: [dependsOnTaskId], references: [id], onDelete: SetNull)
+  blockedTasks  MatterTask[] @relation("MatterTaskDependency")
+
+  @@index([matterId, status])
+  @@index([matterId, dueDate])
+  @@index([assigneeId])
+  @@index([dependsOnTaskId])
+}
+
+enum MatterFieldType {
+  STRING
+  NUMBER
+  DATE
+  BOOLEAN
+  ENUM
+  CURRENCY
+}
+
+/// Per-organization custom field definitions per matter type. The values
+/// land in Matter.customFieldsJson keyed by fieldKey. Activated when a
+/// matter of the given type is created or edited.
+model MatterFieldTemplate {
+  id             String          @id @default(cuid())
+  organizationId String
+  matterType     MatterType
+  fieldKey       String
+  fieldLabel     String
+  fieldType      MatterFieldType
+  isRequired     Boolean         @default(false)
+  displayOrder   Int             @default(0)
+  /// For ENUM fields: ["option-a", "option-b"]. Empty array otherwise.
+  enumOptions    Json            @default("[]")
+  helpText       String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@unique([organizationId, matterType, fieldKey])
+  @@index([organizationId, matterType, displayOrder])
+}
+
+/// Per-(organization, matter type) configuration: numbering format,
+/// default folder structure, closeout checklist, default calendar events.
+/// Reads from this table seed module behaviour (number assignment,
+/// folder auto-create on M365 binding, FRCP defaults, closeout gating).
+model MatterTypeConfig {
+  id                     String     @id @default(cuid())
+  organizationId         String
+  matterType             MatterType
+  /// Format string with placeholders: {YYYY}, {YY}, {TYPE}, {SEQ:n} (zero-padded).
+  /// Default: "M-{YYYY}-{SEQ:4}".
+  numberingFormat        String     @default("M-{YYYY}-{SEQ:4}")
+  /// Per-org sequence counter for this matter type. Incremented on assignment.
+  numberingSequence      Int        @default(0)
+  /// Sub-folder names auto-created when a matter is bound to M365.
+  /// Default for LITIGATION: ["Pleadings","Motions","Discovery","Correspondence","Settlement"].
+  defaultFolderStructure Json       @default("[]")
+  /// Closeout checklist — array of { key, label, required } items. Required
+  /// items must have a completed MatterTask of the same closeoutKey before
+  /// the matter can transition to CLOSED.
+  closeoutChecklist      Json       @default("[]")
+  /// Calendar events seeded on matter creation, e.g. statutory deadlines.
+  defaultCalendarEvents  Json       @default("[]")
+  /// Document templates suggested per matter type (e.g. Litigation has
+  /// "Complaint", "Answer", "Discovery Request"). { key, name, contentRef }.
+  documentTemplates      Json       @default("[]")
+  createdAt              DateTime   @default(now())
+  updatedAt              DateTime   @updatedAt
+
+  @@unique([organizationId, matterType])
+  @@index([organizationId])
+}
+
+// ── Legal Hold (within Matter) ────────────────────────────────────
+//
+// Sub-PR 4b reshape — event-sourced lifecycle, jurisdiction-aware,
+// per-custodian release, snapshot notice templates, deterministic
+// defensibility scorecard. Old tables (HoldNotice / HoldAttestation /
+// PreservationOrder + the PreservationDataSource enum) are replaced
+// by LegalHoldCustodian + CustodianDataSource + HoldNoticeIssuance;
+// see migration 4b_legal_hold_core.
+
+enum LegalHoldStatus {
+  DRAFT
+  ISSUED
+  ACTIVE
+  PARTIALLY_RELEASED
+  RELEASED
+}
+
+enum DataSourceType {
+  EMAIL_MAILBOX
+  ARCHIVED_MAILBOX
+  DEPARTED_USER_MAILBOX
+  ONEDRIVE
+  SHAREPOINT_SITE
+  TEAMS_CHANNEL
+  TEAMS_DM
+  TEAMS_PRIVATE_CHANNEL
+  SLACK_CHANNEL
+  SLACK_DM
+  GOOGLE_DRIVE
+  GOOGLE_CHAT
+  EPHEMERAL_CHAT_AUTO_DELETE
+  LOCAL_DEVICE
+  PHYSICAL_FILES
+  THIRD_PARTY_SAAS
+  OTHER
+}
+
+enum PreservationAction {
+  LEGAL_HOLD_IN_PLACE
+  COPIED_TO_PRESERVATION_VAULT
+  SNAPSHOT_TAKEN
+  RETENTION_SUSPENDED
+  THIRD_PARTY_COLLECTION_PENDING
+  NOT_APPLICABLE
+  PRESERVATION_FAILED
+}
+
+/// Per-data-source preservation lifecycle (sub-PR 4d.0).
+///
+/// Five states surfaced in the hold workspace as colored badges so
+/// counsel can see at a glance which sources are actually preserved
+/// at Microsoft vs. queued vs. failed. Distinct from
+/// `PreservationAction` (which describes the kind of preservation
+/// requested) — this is the lifecycle of THAT request.
+enum DataSourcePreservationStatus {
+  /// Hold created but applyPreservation has not yet been called.
+  NOT_REQUESTED
+  /// Request sent to Microsoft Purview, awaiting confirmation that
+  /// the preservation lock is active.
+  PENDING
+  /// Microsoft confirmed preservation lock active.
+  ON_HOLD
+  /// Microsoft returned an error; needs retry. The
+  /// `preservationFailureReason` carries the Microsoft message.
+  ERROR
+  /// Hold released (releasePreservation succeeded).
+  RELEASED
+}
+
+enum LegalHoldEventType {
+  HOLD_DRAFTED
+  TRIGGER_RECORDED
+  TRIGGER_UPDATED
+  HOLD_ISSUED
+  CUSTODIAN_ADDED
+  CUSTODIAN_REMOVED
+  CUSTODIAN_ACKNOWLEDGED
+  CUSTODIAN_RE_ATTESTED
+  REMINDER_SENT
+  ESCALATED
+  DATA_SOURCE_ADDED
+  DATA_SOURCE_PRESERVATION_APPLIED
+  DATA_SOURCE_PRESERVATION_CONFIRMED
+  DATA_SOURCE_PRESERVATION_FAILED
+  SCOPE_AMENDED
+  CUSTODIAN_DEPARTED
+  CUSTODIAN_PARTIALLY_RELEASED
+  HOLD_RELEASED
+  HOLD_RE_OPENED
+}
+
+model LegalHold {
+  id                        String          @id @default(cuid())
+  organizationId            String
+  matterId                  String
+  /// Org-unique. Format default LH-{YYYY}-{SEQ:4}; assigned at issue time.
+  holdNumber                String?
+  title                     String
+  /// Markdown.
+  scopeDescription          String
+  /// ISO 3166-1 alpha-2 codes plus US state codes ("US-CA", "US-NY").
+  jurisdictions             String[]        @default([])
+  /// Lifecycle (denormalized — always derivable from LegalHoldEvent).
+  status                    LegalHoldStatus @default(DRAFT)
+  triggeredAt               DateTime?
+  triggerEventDescription   String?
+  issuedAt                  DateTime?
+  releasedAt                DateTime?
+  /// When set, overrides OrganizationHoldPolicy fields per-hold.
+  customPolicyJson          Json?
+  /// Privilege & departure flags (commitment I).
+  /// Shape: { hasInhouseCounselCustodian, hasOutsideCounselCustodian,
+  ///          attorneyClientFlagged, workProductFlagged }
+  privilegeFlags            Json            @default("{}")
+  affectsDepartedCustodians Boolean         @default(false)
+  /// Attribution.
+  createdById               String
+  releasedById              String?
+  releaseReason             String?
+  /// Graph linkage (sub-PR 4c). Populated when the hold is mirrored
+  /// into Microsoft Purview as an `ediscoveryCase`. Null until the
+  /// first successful real-Graph applyPreservation call; remains null
+  /// when the org runs against MockM365Client (no creds / E5 absent).
+  graphEdiscoveryCaseId     String?
+  graphHoldPolicyId         String?
+  createdAt                 DateTime        @default(now())
+  updatedAt                 DateTime        @updatedAt
+
+  organization    Organization                 @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  matter          Matter                       @relation(fields: [matterId], references: [id], onDelete: Cascade)
+  createdBy       User                         @relation("LegalHoldCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  releasedBy      User?                        @relation("LegalHoldReleasedBy", fields: [releasedById], references: [id], onDelete: SetNull)
+  custodians      LegalHoldCustodian[]
+  noticeIssuances HoldNoticeIssuance[]
+  events          LegalHoldEvent[]
+  triggerEvents   HoldTriggerEvent[]
+  departures      DepartedCustodianRetention[]
+  scoreSnapshots  HoldDefensibilityScoreSnapshot[]
+
+  @@unique([organizationId, holdNumber])
+  @@index([organizationId, status])
+  @@index([matterId])
+}
+
+model LegalHoldCustodian {
+  id                           String    @id @default(cuid())
+  legalHoldId                  String
+  personId                     String
+  /// Acknowledgment of receipt.
+  acknowledgedAt               DateTime?
+  /// { ip, userAgent, attestationStatement }
+  acknowledgmentMetadata       Json?
+  /// Periodic re-attestation (commitment 5).
+  lastReAttestedAt             DateTime?
+  nextReAttestationDueAt       DateTime?
+  /// Per-custodian release (supports partial release of the hold).
+  releasedAt                   DateTime?
+  releaseReason                String?
+  /// Departure handling (commitment E).
+  departureRecordedAt          DateTime?
+  departedCustodianRetentionId String?   @unique
+  /// Graph linkage (sub-PR 4c). graphHoldStatus mirrors Graph's own
+  /// applied/applying/partial/failed state on the corresponding
+  /// `ediscoveryCustodian`. graphLastSyncedAt is the timestamp of
+  /// the most recent successful applyHold/removeHold round-trip.
+  graphCustodianId             String?
+  graphHoldStatus              String?
+  graphLastSyncedAt            DateTime?
+  createdAt                    DateTime  @default(now())
+  updatedAt                    DateTime  @updatedAt
+
+  legalHold         LegalHold                   @relation(fields: [legalHoldId], references: [id], onDelete: Cascade)
+  person            Person                      @relation(fields: [personId], references: [id], onDelete: Cascade)
+  dataSources       CustodianDataSource[]
+  departedRetention DepartedCustodianRetention? @relation(fields: [departedCustodianRetentionId], references: [id], onDelete: SetNull)
+
+  @@unique([legalHoldId, personId])
+  @@index([legalHoldId])
+  @@index([nextReAttestationDueAt])
+}
+
+model CustodianDataSource {
+  id                        String             @id @default(cuid())
+  legalHoldCustodianId      String
+  type                      DataSourceType
+  externalIdentifier        String
+  displayLabel              String
+  preservationAction        PreservationAction @default(LEGAL_HOLD_IN_PLACE)
+  /// Lifecycle of the preservation push to Microsoft (sub-PR 4d.0).
+  /// Defaults to NOT_REQUESTED on row create; transitions to
+  /// PENDING when applyPreservation is in flight, ON_HOLD on
+  /// confirmation, ERROR on failure, RELEASED on hold release.
+  preservationStatus        DataSourcePreservationStatus @default(NOT_REQUESTED)
+  preservationAppliedAt     DateTime?
+  preservationConfirmedAt   DateTime?
+  preservationConfirmedById String?
+  preservationFailureReason String?
+  /// Surfaces D2 risk (e.g. ephemeral chat with no override).
+  retentionPolicyConflict   Boolean            @default(false)
+  metadataJson              Json?
+  /// Graph linkage (sub-PR 4c). The Graph eDiscovery custodian's
+  /// userSource or siteSource id; populated on successful applyHold.
+  /// graphSourceType is "userSource" | "siteSource".
+  graphSourceId             String?
+  graphSourceType           String?
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
+
+  legalHoldCustodian      LegalHoldCustodian @relation(fields: [legalHoldCustodianId], references: [id], onDelete: Cascade)
+  preservationConfirmedBy User?              @relation("CustodianDataSourceConfirmedBy", fields: [preservationConfirmedById], references: [id], onDelete: SetNull)
+
+  @@index([legalHoldCustodianId])
+  @@index([type, preservationAction])
+}
+
+model HoldNoticeTemplate {
+  id              String   @id @default(cuid())
+  organizationId  String
+  name            String
+  /// null = default template; otherwise ISO jurisdiction code.
+  jurisdictionKey String?
+  bodyMarkdown    String
+  /// SHA-256 of bodyMarkdown — content-hashed artifact.
+  bodyHash        String
+  version         Int      @default(1)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  organization Organization                @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  issuances    HoldNoticeIssuance[]
+  versions     HoldNoticeTemplateVersion[]
+
+  @@index([organizationId, jurisdictionKey, isActive])
+}
+
+/// Hold scope templates (sub-PR 4c.4, Item 12).
+///
+/// Pre-written scope language + default jurisdictions for common
+/// litigation patterns (employment dispute, IP litigation,
+/// regulatory inquiry, …). Selecting a template in the create-hold
+/// form auto-fills `scopeDescription` and `jurisdictions`; the user
+/// can edit before submitting.
+///
+/// `defaultCustodianFiltersJson` is reserved for a later pass that
+/// auto-discovers candidate custodians per template (e.g.
+/// "Engineering employees in California"). Today the field stays
+/// null and is reserved.
+model HoldScopeTemplate {
+  id                          String   @id @default(cuid())
+  organizationId              String
+  name                        String
+  description                 String?
+  scopeMarkdown               String
+  defaultJurisdictions        String[] @default([])
+  defaultCustodianFiltersJson Json?
+  createdById                 String
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation("HoldScopeTemplateCreatedBy", fields: [createdById], references: [id])
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+/// Defensibility score snapshots (sub-PR 4c.5, Item 15).
+///
+/// One row per (hold, computedAt). Written daily by the recurring
+/// snapshot job + on every score-affecting mutation (custodian add,
+/// ack, preservation confirm, release, etc.). The header strip's
+/// sparkline reads the most-recent N snapshots; the trend modal
+/// reads the full history.
+///
+/// Retention: 90 days at daily resolution, then weekly summaries
+/// kept indefinitely (cleanup job runs weekly).
+model HoldDefensibilityScoreSnapshot {
+  id             String   @id @default(cuid())
+  legalHoldId    String
+  score          Int
+  componentsJson Json
+  gapCount       Int
+  computedAt     DateTime @default(now())
+
+  legalHold LegalHold @relation(fields: [legalHoldId], references: [id], onDelete: Cascade)
+
+  @@index([legalHoldId, computedAt])
+}
+
+/// Saved views (sub-PR 4c.5, Item 16).
+///
+/// Filter + sort state persisted per scope (custodians list, holds
+/// list, audit log, …). Owned by a specific user; can be marked
+/// `isShared` to surface org-wide. `isDefault` makes the view auto-
+/// apply the next time the owner opens that scope.
+///
+/// `filterStateJson` is intentionally opaque to the DB layer — the
+/// shape varies per scope and the UI is responsible for serialising
+/// + deserialising. Treat it as a typed blob; do not query inside.
+model SavedView {
+  id              String         @id @default(cuid())
+  organizationId  String
+  ownerId         String
+  scope           SavedViewScope
+  name            String
+  filterStateJson Json
+  isShared        Boolean        @default(false)
+  isDefault       Boolean        @default(false)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner        User         @relation("SavedViewOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, scope, ownerId])
+  @@index([organizationId, scope, isShared])
+}
+
+enum SavedViewScope {
+  LEGAL_HOLD_CUSTODIANS
+  LEGAL_HOLDS_LIST
+  MATTER_LIST
+  AUDIT_LOG
+}
+
+/// Notice template version history (sub-PR 4c.5, Item 17).
+///
+/// Every save of a HoldNoticeTemplate writes one row here. The
+/// template's `version` + `bodyHash` columns mirror the latest
+/// version row. Older `HoldNoticeIssuance` rows still resolve
+/// against the matching version row by (templateId, version),
+/// so the notice viewer can reconstruct exactly what was sent.
+model HoldNoticeTemplateVersion {
+  id           String   @id @default(cuid())
+  templateId   String
+  version      Int
+  bodyMarkdown String
+  bodyHash     String
+  changeLog    String?
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  template  HoldNoticeTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  createdBy User               @relation("HoldNoticeTemplateVersionCreatedBy", fields: [createdById], references: [id])
+
+  @@unique([templateId, version])
+  @@index([templateId, createdAt])
+}
+
+model HoldNoticeIssuance {
+  id                 String   @id @default(cuid())
+  legalHoldId        String
+  templateId         String
+  templateVersion    Int
+  bodyHashAtIssuance String
+  recipientCount     Int
+  issuedAt           DateTime @default(now())
+  issuedById         String
+
+  legalHold LegalHold          @relation(fields: [legalHoldId], references: [id], onDelete: Cascade)
+  template  HoldNoticeTemplate @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  issuedBy  User               @relation("HoldNoticeIssuedBy", fields: [issuedById], references: [id], onDelete: Restrict)
+
+  @@index([legalHoldId])
+}
+
+/// Canonical history of a hold. Status & denormalized fields on
+/// LegalHold are a fast-read materialization of this stream — they
+/// must always be derivable from these rows. The `recordHoldEvent`
+/// helper twin-records to AuditLog so the cryptographic chain seals
+/// every hold mutation.
+model LegalHoldEvent {
+  id                  String             @id @default(cuid())
+  legalHoldId         String
+  type                LegalHoldEventType
+  summary             String
+  payloadJson         Json?
+  actorId             String?
+  /// Mirrors AuditLog.actorType — "USER" | "AGENT" | "SYSTEM".
+  actorType           String             @default("USER")
+  /// Links back into the chain-sealed AuditLog row.
+  resultingAuditLogId String?
+  occurredAt          DateTime           @default(now())
+
+  legalHold         LegalHold @relation(fields: [legalHoldId], references: [id], onDelete: Cascade)
+  actor             User?     @relation("LegalHoldEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+  resultingAuditLog AuditLog? @relation("LegalHoldEventAuditLog", fields: [resultingAuditLogId], references: [id], onDelete: SetNull)
+
+  @@index([legalHoldId, occurredAt])
+}
+
+model HoldTriggerEvent {
+  id               String   @id @default(cuid())
+  legalHoldId      String
+  eventDescription String
+  occurredAt       DateTime
+  recordedById     String
+  recordedAt       DateTime @default(now())
+
+  legalHold  LegalHold @relation(fields: [legalHoldId], references: [id], onDelete: Cascade)
+  recordedBy User      @relation("HoldTriggerRecordedBy", fields: [recordedById], references: [id], onDelete: Restrict)
+
+  @@index([legalHoldId])
+}
+
+model OrganizationHoldPolicy {
+  id                            String   @id @default(cuid())
+  organizationId                String   @unique
+  defaultAttestationCadenceDays Int      @default(90)
+  reminderLeadTimeDays          Int      @default(7)
+  /// [{level, afterDays, notifyRoleNames[]}]
+  escalationChainJson           Json     @default("[]")
+  /// {[jurisdiction]: {cadenceDays, mandatoryLanguageMd}}
+  jurisdictionPoliciesJson      Json?
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+}
+
+model DepartedCustodianRetention {
+  id                      String             @id @default(cuid())
+  organizationId          String
+  personId                String
+  legalHoldId             String
+  /// Mocked in 4b; real Graph IT-preservation order id ships in 4c.
+  itPreservationOrderId   String?
+  preservationStatus      PreservationAction @default(THIRD_PARTY_COLLECTION_PENDING)
+  preservationConfirmedAt DateTime?
+  notes                   String?
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  person       Person              @relation(fields: [personId], references: [id], onDelete: Cascade)
+  legalHold    LegalHold           @relation(fields: [legalHoldId], references: [id], onDelete: Cascade)
+  custodian    LegalHoldCustodian?
+
+  @@index([organizationId, preservationStatus])
+}
+
+// ── Agent evidence-grade decisions (locked contract — empty in 4b) ──
+//
+// Architectural commitment A. In 4b the table ships unused; in 4d every
+// Claude-generated recommendation writes a row that must reach
+// APPROVED before the corresponding mutation runs. The mutation gate
+// (refuse to mutate if a PENDING AgentDecision references the action)
+// is enforced now and dormant.
+
+enum AgentApprovalStatus {
+  PENDING
+  APPROVED
+  APPROVED_WITH_OVERRIDE
+  REJECTED
+  /// Policy gate failed before reaching a human.
+  AUTO_REJECTED
+}
+
+model AgentDecision {
+  id                   String              @id @default(cuid())
+  organizationId       String
+  agentName            String
+  modelId              String
+  modelVersion         String
+  promptHash           String
+  retrievedContextHash String?
+  recommendationJson   Json
+  confidence           Float?
+  approvalStatus       AgentApprovalStatus @default(PENDING)
+  approvedById         String?
+  approvedAt           DateTime?
+  overrideReason       String?
+  /// The AuditLog row that records the executed action when approved.
+  resultingAuditLogId  String?
+  /// Polymorphic owner — the resource this decision governs.
+  /// "IntakeTicket" | "LegalHold" | … Mirrors the polymorphic pattern
+  /// used by Document (ownerType/ownerId). Lets a module find "the open
+  /// decision for resource X" without a per-module FK column. Nullable +
+  /// additive: the 4b-locked contract shipped empty, so no rows migrate.
+  resourceType         String?
+  resourceId           String?
+  createdAt            DateTime            @default(now())
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  approvedBy        User?        @relation("AgentDecisionApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  resultingAuditLog AuditLog?    @relation("AgentDecisionAuditLog", fields: [resultingAuditLogId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, agentName, createdAt])
+  @@index([approvalStatus])
+  @@index([organizationId, resourceType, resourceId])
+}
+
+/// Sanctions-screening reference data (Intake P2b — replaces the
+/// hardcoded mockSanctionsCheck). GLOBAL, not org-scoped: OFAC SDN /
+/// EU / UK consolidated lists are public reference data shared across
+/// all tenants. Refreshed by refreshSanctionsList() (admin trigger,
+/// pg-boss-ready) from the live Treasury feed in production; seeded with
+/// a bootstrap set for demo/CI. `normalizedName` is the lowercased,
+/// punctuation-stripped match key. Empty / stale table → screening
+/// returns "unavailable" (→ flag for review), never a false all-clear.
+model SanctionsListEntry {
+  id             String    @id @default(cuid())
+  /// "OFAC-SDN" | "OFAC-CONS" | "EU" | "UK-OFSI" | "UN" | "BOOTSTRAP"
+  source         String
+  /// Stable id within the source feed (uid / ent_num), for upsert.
+  sourceRef      String
+  entityName     String
+  /// Lowercased, punctuation-stripped — the match key.
+  normalizedName String
+  /// "individual" | "entity" | "vessel" | "aircraft"
+  entityType     String?
+  /// Sanctions programs, e.g. ["SDGT","IRAN"].
+  programs       String[]
+  /// Known aliases (AKAs), normalized.
+  aliasesJson    Json      @default("[]")
+  country        String?
+  listedAt       DateTime?
+  /// When this row was last written by a refresh pass — drives staleness.
+  refreshedAt    DateTime  @default(now())
+
+  @@unique([source, sourceRef])
+  @@index([normalizedName])
+  @@index([source, refreshedAt])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 5. Legal Intake
+// ════════════════════════════════════════════════════════════════════
+//
+// Replaces the v8 demo's localStorage-backed ticket store. The polyfill
+// at modules/intake/src/storage/polyfill.js routes through API endpoints
+// that read/write these tables. Conservative AI governance (Differentiator
+// #3) is realised here: every AgentRecommendation review writes an
+// AuditLog entry, and the demo gates approve/edit/reject keyboard
+// shortcuts on a human attorney.
+
+enum IntakeSource {
+  FORM
+  COPILOT
+  EMAIL
+  SLACK
+  API
+}
+
+enum IntakeStatus {
+  AWAITING_TRIAGE
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  ESCALATED
+  CLOSED
+}
+
+model IntakeTicket {
+  id             String       @id // human-readable: "REQ-3501". Not cuid.
+  organizationId String
+  requesterId    String // Person id (Person.type = EMPLOYEE)
+  matterId       String? // optional — link to Matter created from this ticket
+  source         IntakeSource @default(FORM)
+
+  type        String // "NDA Request", "Contract Question", …
+  priority    String // "Critical" | "High" | "Medium" | "Low"
+  status      IntakeStatus @default(AWAITING_TRIAGE)
+  stage       String       @default("new") // "new" | "triaged" | "approved" | "closed"
+  description String
+  department  String? // requester's department (denormalised)
+  assignedTo  String? // free-text routing: "Cockpit Queue", "Rachel Adams", …
+
+  slaHours  Int
+  slaStatus String // "On Track" | "At Risk" | "Breached"
+
+  /// Free-form blob from classifyIntakeRegex / classifyIntakeClaude.
+  /// Modeled fields would over-constrain — categories evolve.
+  aiTriageJson Json?
+
+  /// Mirror of `workflow` array from v8 seed: [{label, done, active}]
+  workflowJson Json @default("[]")
+
+  /// Triage decision recorded when the attorney closes the ticket.
+  triagedBy        String?
+  triagedAt        DateTime?
+  triagedAction    String? // "approved" | "rejected" | "reassigned" | …
+  agentProcessedAt DateTime?
+
+  /// Phase 1b — typed assignee. Lives alongside the legacy free-text
+  /// `assignedTo` during migration; new code paths set this FK and
+  /// `assignedTo` mirrors `User.name` for display back-compat.
+  /// "My Queue" filter, Kanban swimlanes, and routing-rule audit
+  /// rows all key off this column. Sunset of `assignedTo` is
+  /// scheduled for end of P3 (per docs/intake-roadmap.md §5.1).
+  assignedToUserId String?
+
+  /// P2a — which routing rules fired on this ticket. Shape:
+  /// { ruleIds: string[], firedAt: ISO,
+  ///   summaries: [{ id, name, actions: string[] }] }.
+  /// Written only by applyRoutingRules in the saveTicketsV8
+  /// chokepoint; the Cockpit renders the "routed by" chip from it.
+  firedRulesJson Json?
+
+  /// P4b hardening — the source message's stable id (email
+  /// internetMessageId, webhook-supplied messageId). Used to dedupe
+  /// inbound delivery: a webhook retry or a Graph notification replay of
+  /// the same message resolves to the existing ticket instead of creating
+  /// a duplicate. Null for FORM / COPILOT tickets. Unique per org (NULLs
+  /// are distinct in Postgres, so unscoped channels are unaffected).
+  externalMessageId String?
+
+  submittedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  requester    Person       @relation("IntakeRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  matter       Matter?      @relation(fields: [matterId], references: [id], onDelete: SetNull)
+  assignedToUser User?      @relation("IntakeTicketAssignee", fields: [assignedToUserId], references: [id], onDelete: SetNull)
+
+  recommendations AgentRecommendation[]
+  conversation    IntakeConversation[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, priority])
+  @@index([organizationId, submittedAt(sort: Desc)])
+  @@index([requesterId])
+  @@index([matterId])
+  @@index([organizationId, assignedToUserId])
+  @@unique([organizationId, externalMessageId])
+}
+
+/// P2a (demo-lite) — server-side routing rules. Conditions AND
+/// together (every non-null match* must hold); actions apply in
+/// rule `evalOrder` (ascending), later rules seeing earlier rules'
+/// effects. Evaluated only inside the saveTicketsV8 chokepoint for
+/// untriaged tickets — an attorney's triage action always wins over
+/// a rule. The full composable editor at /admin/intake/routing-rules
+/// (with escalateTo / requireApprovalFrom actions) lands in P2a
+/// proper; this model is forward-compatible with it.
+model IntakeRoutingRule {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  enabled        Boolean @default(true)
+  /// Evaluation order, ascending. Not called "priority" to avoid
+  /// confusion with the ticket-priority dimension it can match/set.
+  evalOrder      Int     @default(100)
+
+  // ── Conditions (null = no constraint; non-null AND together) ──
+  matchType       String?
+  matchPriority   String?
+  matchDepartment String?
+  /// Case-insensitive substring on the ticket description.
+  matchKeyword    String?
+
+  // ── Actions (null = no-op) ──
+  setAssigneeUserId String?
+  setPriority       String?
+  setSlaHours       Int?
+
+  /// Effectiveness counters for the SLA Operations view.
+  timesFired  Int       @default(0)
+  lastFiredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assignee     User?        @relation("IntakeRoutingRuleAssignee", fields: [setAssigneeUserId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, enabled, evalOrder])
+}
+
+/// P4b — a Microsoft 365 mailbox AEGIS polls for inbound intake email.
+/// `pollMailboxForIntake` reads new messages via the delegated Graph
+/// service account and runs each through the same ingest path as the
+/// P4a webhook. `lastReceivedAt` is the delta watermark (Graph
+/// `receivedDateTime gt`), so re-polling is idempotent.
+model IntakeEmailMailbox {
+  id             String  @id @default(cuid())
+  organizationId String
+  /// Mailbox UPN / address to poll, e.g. "legal-intake@contoso.com".
+  address        String
+  displayName    String?
+  enabled        Boolean @default(true)
+  /// When true, the poller sends a threaded auto-acknowledgement reply to
+  /// the sender as soon as a message becomes a ticket. Off by default.
+  autoAckEnabled Boolean @default(false)
+
+  /// Delta watermark — receivedDateTime of the newest ingested message.
+  lastReceivedAt DateTime?
+  lastPolledAt   DateTime?
+  lastError      String?
+
+  createdBy String // User id
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, address])
+  @@index([organizationId, enabled])
+}
+
+enum AgentRecommendationStatus {
+  PENDING
+  APPROVED
+  EDITED
+  REJECTED
+}
+
+/// One ticket may have multiple recommendations over time (rerun on edit,
+/// agent escalation, etc.). The most recent one is the "current" rec.
+model AgentRecommendation {
+  id              String                    @id @default(cuid())
+  ticketId        String
+  agentId         String // "nda-agent", "faq-agent", …
+  confidence      Float
+  suggestedAction String // "approve-and-send", "flag-for-review", "escalate"
+  draftedResponse String // long text — full drafted reply
+  reasoning       String // why the agent recommends this
+  concerns        Json                      @default("[]") // string[]
+  citations       Json                      @default("[]") // [{id, title}]
+  shortFormReply  String? // optional one-liner
+  status          AgentRecommendationStatus @default(PENDING)
+  reviewedBy      String? // User id
+  reviewedAt      DateTime?
+  createdAt       DateTime                  @default(now())
+
+  ticket IntakeTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([reviewedBy])
+}
+
+enum ConversationRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+/// Per-message log of the Copilot conversation that produced a ticket.
+/// Canonical source — IntakeTicket.aiTriageJson does NOT duplicate this.
+model IntakeConversation {
+  id              String           @id @default(cuid())
+  ticketId        String
+  role            ConversationRole
+  content         String
+  fieldsExtracted Json? // structured extraction snapshot
+  timestamp       DateTime         @default(now())
+
+  ticket IntakeTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, timestamp])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 6. Spend & Counsel
+// ════════════════════════════════════════════════════════════════════
+//
+// Vendors attach to Counterparty (a law firm IS a counterparty too).
+// Invoices attach to Matter. Step 6 will implement the cross-module
+// API: Matter.getMatterCostBasis() → Spend.getMatterSpendSummary().
+
+enum VendorType {
+  LAW_FIRM
+  COURT_REPORTER
+  EXPERT_WITNESS
+  ALSP
+  OTHER
+}
+
+model Vendor {
+  id               String     @id @default(cuid())
+  organizationId   String
+  name             String
+  type             VendorType
+  counterpartyId   String? // for law firms — link to the Counterparty record
+  ratesCard        Json       @default("{}") // { tier: rate } map
+  performanceScore Float?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  counterparty Counterparty? @relation(fields: [counterpartyId], references: [id], onDelete: SetNull)
+
+  invoices    Invoice[]
+  timekeepers Timekeeper[]
+
+  @@index([organizationId, type])
+  @@index([organizationId, name])
+  @@index([counterpartyId])
+}
+
+enum InvoiceStatus {
+  SUBMITTED
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  PAID
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  vendorId       String
+  matterId       String
+  amount         Float
+  currency       String        @default("USD")
+  periodStart    DateTime
+  periodEnd      DateTime
+  status         InvoiceStatus @default(SUBMITTED)
+  ledesData      Json? // LEDES upload payload
+  submittedAt    DateTime      @default(now())
+  approvedBy     String? // User id
+  approvedAt     DateTime?
+  rejectedReason String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  matter Matter @relation(fields: [matterId], references: [id], onDelete: Cascade)
+
+  lineItems InvoiceLineItem[]
+
+  @@index([vendorId])
+  @@index([matterId])
+  @@index([status])
+  @@index([submittedAt(sort: Desc)])
+}
+
+enum InvoiceLineStatus {
+  PENDING
+  FLAGGED
+  ACCEPTED
+  REDUCED
+}
+
+model InvoiceLineItem {
+  id            String            @id @default(cuid())
+  invoiceId     String
+  timekeeperId  String?
+  hours         Float
+  rate          Float
+  description   String
+  date          DateTime
+  status        InvoiceLineStatus @default(PENDING)
+  flaggedReason String?
+
+  invoice    Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  timekeeper Person? @relation(fields: [timekeeperId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([timekeeperId])
+  @@index([status])
+}
+
+enum BudgetScope {
+  MATTER
+  DEPARTMENT
+  ANNUAL
+}
+
+model Budget {
+  id              String      @id @default(cuid())
+  organizationId  String
+  scope           BudgetScope
+  scopeId         String // Matter id, department name, or year
+  period          String // e.g. "2026", "2026-Q2"
+  allocatedAmount Float
+  spentAmount     Float       @default(0)
+  currency        String      @default("USD")
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, scope, scopeId, period])
+  @@index([organizationId, scope])
+}
+
+model Timekeeper {
+  id          String @id @default(cuid())
+  vendorId    String
+  personId    String // Person.type = EXTERNAL_COUNSEL
+  title       String
+  defaultRate Float
+  blendedRate Float?
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([vendorId, personId])
+  @@index([vendorId])
+  @@index([personId])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 7. Privacy & Compliance Operations
+// ════════════════════════════════════════════════════════════════════
+//
+// DSAR is first-class. Data subjects are Persons (Person.type = DATA_SUBJECT).
+// Custodian/data-subject overlap detection is a job for @aegis/identity-graph
+// once that package ships (Step 7+).
+
+enum DSARRequestType {
+  ACCESS
+  CORRECTION
+  ERASURE
+  PORTABILITY
+  OBJECT
+  RESTRICT_PROCESSING
+}
+
+enum DSARStatus {
+  RECEIVED
+  VERIFYING
+  IN_PROGRESS
+  AWAITING_REVIEW
+  FULFILLED
+  REJECTED
+  WITHDRAWN
+}
+
+enum DSARVerificationStatus {
+  UNVERIFIED
+  IN_PROGRESS
+  VERIFIED
+  FAILED
+}
+
+model DataSubjectRequest {
+  id                 String                 @id @default(cuid())
+  organizationId     String
+  requesterPersonId  String
+  requestType        DSARRequestType
+  jurisdiction       String // ISO 3166-1 alpha-2 or region code
+  status             DSARStatus             @default(RECEIVED)
+  slaDeadline        DateTime
+  submittedAt        DateTime               @default(now())
+  completedAt        DateTime?
+  verificationStatus DSARVerificationStatus @default(UNVERIFIED)
+  response           Json? // fulfillment payload or rejection reason
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  requesterPerson Person       @relation(fields: [requesterPersonId], references: [id], onDelete: Cascade)
+
+  dataLocations DSARDataLocation[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, slaDeadline])
+  @@index([requesterPersonId])
+}
+
+model DSARDataLocation {
+  id                 String    @id @default(cuid())
+  requestId          String
+  system             String // "Salesforce", "HRIS", "Marketing-DB", …
+  dataType           String // "contact-info", "transaction-history", …
+  found              Boolean   @default(false)
+  redactionsRequired Boolean   @default(false)
+  retrievedAt        DateTime?
+
+  request DataSubjectRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, system, dataType])
+  @@index([requestId])
+}
+
+enum ConsentMechanism {
+  EXPLICIT
+  LEGITIMATE_INTEREST
+  CONTRACT
+  LEGAL_OBLIGATION
+  VITAL_INTEREST
+  PUBLIC_TASK
+}
+
+model ConsentRecord {
+  id                  String           @id @default(cuid())
+  organizationId      String
+  dataSubjectPersonId String
+  purpose             String
+  capturedAt          DateTime         @default(now())
+  withdrawnAt         DateTime?
+  mechanism           ConsentMechanism
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  dataSubjectPerson Person       @relation(fields: [dataSubjectPersonId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, dataSubjectPersonId])
+  @@index([organizationId, withdrawnAt])
+}
+
+/// Record of Processing Activities (Article 30 GDPR / Section 9 DPDPA).
+/// The systematic catalog of what data we process, why, on what basis,
+/// and where it goes. ROPA is the regulator-facing artifact; this table
+/// is its source of truth.
+model DataProcessingActivity {
+  id                    String   @id @default(cuid())
+  organizationId        String
+  name                  String
+  lawfulBasis           String // free-form for jurisdiction flex
+  dataTypes             Json     @default("[]")
+  retentionPeriodDays   Int
+  dataSubjectCategories Json     @default("[]")
+  systems               Json     @default("[]")
+  transferredCountries  Json     @default("[]")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+enum PrivacyIncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum PrivacyIncidentStatus {
+  REPORTED
+  INVESTIGATING
+  CONTAINED
+  RESOLVED
+}
+
+model PrivacyIncident {
+  id                   String                  @id @default(cuid())
+  organizationId       String
+  severity             PrivacyIncidentSeverity
+  discoveredAt         DateTime
+  reportedAt           DateTime?
+  affectedRecordsCount Int                     @default(0)
+  status               PrivacyIncidentStatus   @default(REPORTED)
+  regulatorNotified    Boolean                 @default(false)
+  mitigationSteps      Json                    @default("[]")
+  description          String?
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([organizationId, severity])
+  @@index([organizationId, discoveredAt(sort: Desc)])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 8. UserPreference — KV for UI prefs
+// ════════════════════════════════════════════════════════════════════
+//
+// Cockpit position, agent on/off toggles, transient conversation drafts.
+// Not domain data — UI state. Keyed by (userId, key). Lives here rather
+// than as JSON on User so prefs can be evicted independently.
+
+model UserPreference {
+  id        String   @id @default(cuid())
+  userId    String
+  key       String // e.g. "aegis:intake:cockpit-state:v1"
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@index([userId])
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 9. M365 Per-Organization Credentials (sub-PR 4c)
+// ════════════════════════════════════════════════════════════════════
+//
+// One row per organisation that has a Microsoft 365 tenant
+// connection. The factory in `modules/matter/src/internal/services/
+// m365-factory.ts` resolves credentials in this order:
+//
+//   1. row in OrganizationM365Credential (per-org override)
+//   2. M365_TENANT_ID + M365_CLIENT_ID + M365_CLIENT_SECRET env vars
+//   3. MockM365Client fallback
+//
+// `encryptedClientSecret` ships with a dev-only PLAINTEXT
+// implementation (UTF-8 of the secret). The interface in
+// `packages/db/src/crypto.ts` is stable; KMS-backed envelope
+// encryption replaces the implementation before first paying
+// customer (see CLAUDE.md "Documented exceptions").
+
+model OrganizationM365Credential {
+  id                    String    @id @default(cuid())
+  organizationId        String    @unique
+  /// Tenant id is not a secret.
+  tenantId              String
+  /// Client id is not a secret.
+  clientId              String
+  /// Encrypted at rest via @aegis/db.encryptSecret. 4c ships dev-only
+  /// plaintext (sunset before first paying customer).
+  encryptedClientSecret Bytes
+  /// Override for sovereign clouds (Azure China, GCC High); defaults
+  /// to the global Graph endpoint.
+  graphBaseUrl          String    @default("https://graph.microsoft.com")
+  isActive              Boolean   @default(true)
+  /// Last time `verifyM365Credentials` round-tripped successfully.
+  lastVerifiedAt        DateTime?
+  lastErrorMessage      String?
+  /// Lifecycle.
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  /// Last time `rotateOrgM365Secret` ran. The factory cache invalidates
+  /// when this changes.
+  rotatedAt             DateTime?
+
+  // ── Delegated authentication (sub-PR 4c.1) ─────────────────────────
+  // Microsoft's eDiscovery endpoints don't honor application-permissions
+  // tokens; they require a delegated user token. AEGIS uses a dedicated
+  // M365 service account authorized once per org via Device Code OAuth.
+  // The refresh token is encrypted at rest with the same v1 prefix
+  // pattern as `encryptedClientSecret` (sunset to KMS before first
+  // paying customer per CLAUDE.md "Documented exceptions").
+  delegatedRefreshToken     Bytes?
+  delegatedAccountUpn       String?
+  delegatedAuthorizedAt     DateTime?
+  delegatedAuthorizedById   String?
+  delegatedTokenExpiresAt   DateTime?
+  delegatedLastRefreshedAt  DateTime?
+  delegatedLastRefreshError String?
+  delegatedScopesGranted    String[]
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, isActive])
+}
+
+/// Persisted Device Code OAuth flow session (sub-PR 4c.1 follow-up).
+///
+/// Why this lives in the database. Vercel serverless dispatches each
+/// HTTP request to one of N Lambda instances at random. The 4c.1
+/// implementation kept session state in a `Map<sessionId, …>` in
+/// module scope on a single instance — `/initiate` would write the
+/// session to instance A, but `/poll` requests round-robined across
+/// every instance. Instances B/C/D returned SESSION_NOT_FOUND;
+/// Microsoft eventually issued tokens to whichever instance happened
+/// to receive the in-flight `/poll` at the moment of sign-in
+/// completion, but that instance had no session row to update —
+/// tokens were silently discarded and `/admin/m365` stayed at
+/// NOT CONNECTED.
+///
+/// Persisting to Postgres makes the flow stateless across instances:
+/// any `/poll` request reads the `device_code` (the long opaque
+/// Microsoft handle) from the row and polls the Microsoft `/token`
+/// endpoint directly. The first poll to receive an authorized
+/// response writes the tokens to `OrganizationM365Credential` and
+/// flips this row to `completed` in a transaction.
+///
+/// Lifecycle:
+///   pending  → initiate wrote the row; user hasn't signed in yet
+///   completed → tokens persisted; row can be discarded
+///   expired   → 15-min TTL elapsed without sign-in
+///   error     → Microsoft refused (access_denied, invalid_client, …)
+///
+/// Cleanup: rows with `expiresAt < now() - 24h` are eligible for
+/// pruning; the prune service is exposed to the admin /jobs page.
+/// Rows are small (< 1 KB each) so the cleanup is opportunistic.
+model M365DeviceCodeSession {
+  id              String    @id @default(cuid())
+  organizationId  String
+  initiatedById   String
+  /// Long opaque code Microsoft returned at /devicecode. Used by
+  /// every `/poll` to ask /token "are tokens ready yet". NOT shown
+  /// to the user — this is the polling secret, not the display code.
+  deviceCode      String
+  /// 4-character display code shown to the user in the admin UI
+  /// modal. They paste this at https://microsoft.com/devicelogin.
+  userCode        String
+  verificationUri String
+  expiresAt       DateTime
+  pollIntervalSec Int       @default(5)
+  /// Reserved. The current implementation calls Microsoft's OAuth
+  /// endpoints directly so MSAL is not in the path; this column
+  /// stays nullable so a future MSAL-based implementation has a
+  /// place to serialise its token-acquisition cache without a
+  /// schema bump.
+  msalCacheJson   String?
+  status          String    @default("pending")
+  completedAt     DateTime?
+  /// Set when status is `completed` so the UI can confirm which
+  /// account signed in without rebuilding from the audit log.
+  accountUpn      String?
+  /// JSON-array of OAuth scope strings Microsoft actually granted.
+  scopesGrantedJson Json    @default("[]")
+  errorMessage    String?
+  createdAt       DateTime  @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  initiatedBy     User         @relation("M365DeviceCodeSessionInitiator", fields: [initiatedById], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([expiresAt])
+}
