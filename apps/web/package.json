@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 5173",
+    "prebuild": "pnpm --filter @aegis/db exec prisma generate",
     "build": "next build",
     "start": "next start",
     "lint": "next lint --dir src --dir pages",
@@ -16,6 +17,8 @@
     "@aegis/db": "workspace:*",
     "@aegis/admin": "workspace:*",
     "@aegis/intake": "workspace:*",
+    "@aegis/observability": "workspace:*",
+    "@vercel/blob": "^1.1.1",
     "@aegis/matter": "workspace:*",
     "@aegis/ui": "workspace:*",
     "@auth0/nextjs-auth0": "3.5.0",

@@ -20,11 +20,20 @@ export interface RoutingRuleDTO {
   matchPriority: string | null;
   matchDepartment: string | null;
   matchKeyword: string | null;
+  matchComplexity: string | null;
   setAssigneeUserId: string | null;
   /** Resolved User.name for the setAssigneeUserId action. */
   assigneeName: string | null;
   setPriority: string | null;
   setSlaHours: number | null;
+  /** Item 5 — route-to-pool action + resolved IntakeTeam.name mirror. */
+  setTeamId: string | null;
+  teamName: string | null;
+  /** W2-5 — escalate + approval-gate actions + resolved name mirrors. */
+  escalateToUserId: string | null;
+  escalateToName: string | null;
+  requireApprovalFromUserId: string | null;
+  approverName: string | null;
   timesFired: number;
   lastFiredAt: string | null;
 }
@@ -39,12 +48,19 @@ type RuleRow = {
   matchPriority: string | null;
   matchDepartment: string | null;
   matchKeyword: string | null;
+  matchComplexity: string | null;
   setAssigneeUserId: string | null;
   setPriority: string | null;
   setSlaHours: number | null;
+  setTeamId: string | null;
+  escalateToUserId: string | null;
+  requireApprovalFromUserId: string | null;
   timesFired: number;
   lastFiredAt: Date | null;
   assignee: { name: string } | null;
+  team: { name: string } | null;
+  escalateTo: { name: string } | null;
+  approver: { name: string } | null;
 };
 
 const RULE_SELECT = {
@@ -57,12 +73,19 @@ const RULE_SELECT = {
   matchPriority: true,
   matchDepartment: true,
   matchKeyword: true,
+  matchComplexity: true,
   setAssigneeUserId: true,
   setPriority: true,
   setSlaHours: true,
+  setTeamId: true,
+  escalateToUserId: true,
+  requireApprovalFromUserId: true,
   timesFired: true,
   lastFiredAt: true,
   assignee: { select: { name: true } },
+  team: { select: { name: true } },
+  escalateTo: { select: { name: true } },
+  approver: { select: { name: true } },
 } as const;
 
 function toDTO(r: RuleRow): RoutingRuleDTO {
@@ -76,10 +99,17 @@ function toDTO(r: RuleRow): RoutingRuleDTO {
     matchPriority: r.matchPriority,
     matchDepartment: r.matchDepartment,
     matchKeyword: r.matchKeyword,
+    matchComplexity: r.matchComplexity,
     setAssigneeUserId: r.setAssigneeUserId,
     assigneeName: r.assignee?.name ?? null,
     setPriority: r.setPriority,
     setSlaHours: r.setSlaHours,
+    setTeamId: r.setTeamId,
+    teamName: r.team?.name ?? null,
+    escalateToUserId: r.escalateToUserId,
+    escalateToName: r.escalateTo?.name ?? null,
+    requireApprovalFromUserId: r.requireApprovalFromUserId,
+    approverName: r.approver?.name ?? null,
     timesFired: r.timesFired,
     lastFiredAt: r.lastFiredAt?.toISOString() ?? null,
   };
@@ -178,9 +208,13 @@ export interface RoutingRuleInput {
   matchPriority?: string | null;
   matchDepartment?: string | null;
   matchKeyword?: string | null;
+  matchComplexity?: string | null;
   setAssigneeUserId?: string | null;
   setPriority?: string | null;
   setSlaHours?: number | null;
+  setTeamId?: string | null;
+  escalateToUserId?: string | null;
+  requireApprovalFromUserId?: string | null;
 }
 
 export class RoutingRuleValidationError extends Error {
@@ -209,9 +243,13 @@ function assertRuleSemantics(merged: {
   matchPriority: string | null;
   matchDepartment: string | null;
   matchKeyword: string | null;
+  matchComplexity: string | null;
   setAssigneeUserId: string | null;
   setPriority: string | null;
   setSlaHours: number | null;
+  setTeamId: string | null;
+  escalateToUserId: string | null;
+  requireApprovalFromUserId: string | null;
 }) {
   if (!merged.name || merged.name.trim().length === 0) {
     throw new RoutingRuleValidationError("Rule name is required");
@@ -220,7 +258,8 @@ function assertRuleSemantics(merged: {
     !!merged.matchType ||
     !!merged.matchPriority ||
     !!merged.matchDepartment ||
-    !!merged.matchKeyword;
+    !!merged.matchKeyword ||
+    !!merged.matchComplexity;
   if (!hasCondition) {
     throw new RoutingRuleValidationError(
       "A rule needs at least one condition (type / priority / department / keyword).",
@@ -229,10 +268,13 @@ function assertRuleSemantics(merged: {
   const hasAction =
     !!merged.setAssigneeUserId ||
     !!merged.setPriority ||
-    merged.setSlaHours != null;
+    merged.setSlaHours != null ||
+    !!merged.setTeamId ||
+    !!merged.escalateToUserId ||
+    !!merged.requireApprovalFromUserId;
   if (!hasAction) {
     throw new RoutingRuleValidationError(
-      "A rule needs at least one action (assignee / priority / SLA).",
+      "A rule needs at least one action (assignee / pool / priority / SLA / escalate / approval gate).",
     );
   }
 }
@@ -260,11 +302,24 @@ export async function createRoutingRule(
     matchPriority: input.matchPriority ?? null,
     matchDepartment: input.matchDepartment ?? null,
     matchKeyword: input.matchKeyword ?? null,
+    matchComplexity: input.matchComplexity ?? null,
     setAssigneeUserId: input.setAssigneeUserId ?? null,
     setPriority: input.setPriority ?? null,
     setSlaHours: input.setSlaHours ?? null,
+    setTeamId: input.setTeamId ?? null,
+    escalateToUserId: input.escalateToUserId ?? null,
+    requireApprovalFromUserId: input.requireApprovalFromUserId ?? null,
   };
   assertRuleSemantics(merged);
+  if (merged.setTeamId) {
+    await assertTeamExists(organizationId, merged.setTeamId);
+  }
+  if (merged.escalateToUserId) {
+    await assertUserExists(organizationId, merged.escalateToUserId, "Escalation target");
+  }
+  if (merged.requireApprovalFromUserId) {
+    await assertUserExists(organizationId, merged.requireApprovalFromUserId, "Required approver");
+  }
 
   const created = await prisma.intakeRoutingRule.create({
     data: { organizationId, ...merged },
@@ -291,11 +346,40 @@ export async function createRoutingRule(
         setAssigneeUserId: merged.setAssigneeUserId,
         setPriority: merged.setPriority,
         setSlaHours: merged.setSlaHours,
+        setTeamId: merged.setTeamId,
+        escalateToUserId: merged.escalateToUserId,
+        requireApprovalFromUserId: merged.requireApprovalFromUserId,
       },
       evalOrder: merged.evalOrder,
     },
   });
   return toDTO(created);
+}
+
+/** Guard: a route-to-pool action must point at a team in the same org. */
+async function assertTeamExists(organizationId: string, teamId: string) {
+  const team = await prisma.intakeTeam.findFirst({
+    where: { id: teamId, organizationId },
+    select: { id: true },
+  });
+  if (!team) {
+    throw new RoutingRuleValidationError("Route-to-pool team not found in this organization");
+  }
+}
+
+/** Guard: escalate / approval-gate targets must be users in the org. */
+async function assertUserExists(
+  organizationId: string,
+  userId: string,
+  label: string,
+) {
+  const user = await prisma.user.findFirst({
+    where: { id: userId, organizationId },
+    select: { id: true },
+  });
+  if (!user) {
+    throw new RoutingRuleValidationError(`${label} not found in this organization`);
+  }
 }
 
 /**
@@ -333,12 +417,20 @@ export async function updateRoutingRule(
     patch.matchDepartment = normalizeNullable(input.matchDepartment);
   if (input.matchKeyword !== undefined)
     patch.matchKeyword = normalizeNullable(input.matchKeyword);
+  if (input.matchComplexity !== undefined)
+    patch.matchComplexity = normalizeNullable(input.matchComplexity);
   if (input.setAssigneeUserId !== undefined)
     patch.setAssigneeUserId = normalizeNullable(input.setAssigneeUserId);
   if (input.setPriority !== undefined)
     patch.setPriority = normalizeNullable(input.setPriority);
   if (input.setSlaHours !== undefined)
     patch.setSlaHours = input.setSlaHours; // null OK to clear
+  if (input.setTeamId !== undefined)
+    patch.setTeamId = normalizeNullable(input.setTeamId);
+  if (input.escalateToUserId !== undefined)
+    patch.escalateToUserId = normalizeNullable(input.escalateToUserId);
+  if (input.requireApprovalFromUserId !== undefined)
+    patch.requireApprovalFromUserId = normalizeNullable(input.requireApprovalFromUserId);
 
   // Use Object.hasOwn so an explicit `null` in the patch is honored
   // (clears the field) instead of falling back to the prior value
@@ -351,10 +443,26 @@ export async function updateRoutingRule(
     matchPriority: pick("matchPriority") as string | null,
     matchDepartment: pick("matchDepartment") as string | null,
     matchKeyword: pick("matchKeyword") as string | null,
+    matchComplexity: pick("matchComplexity") as string | null,
     setAssigneeUserId: pick("setAssigneeUserId") as string | null,
     setPriority: pick("setPriority") as string | null,
     setSlaHours: pick("setSlaHours") as number | null,
+    setTeamId: pick("setTeamId") as string | null,
+    escalateToUserId: pick("escalateToUserId") as string | null,
+    requireApprovalFromUserId: pick("requireApprovalFromUserId") as string | null,
   });
+  const mergedTeamId = pick("setTeamId") as string | null;
+  if (mergedTeamId && mergedTeamId !== before.setTeamId) {
+    await assertTeamExists(organizationId, mergedTeamId);
+  }
+  const mergedEscalateTo = pick("escalateToUserId") as string | null;
+  if (mergedEscalateTo && mergedEscalateTo !== before.escalateToUserId) {
+    await assertUserExists(organizationId, mergedEscalateTo, "Escalation target");
+  }
+  const mergedApprover = pick("requireApprovalFromUserId") as string | null;
+  if (mergedApprover && mergedApprover !== before.requireApprovalFromUserId) {
+    await assertUserExists(organizationId, mergedApprover, "Required approver");
+  }
 
   const updated = await prisma.intakeRoutingRule.update({
     where: { id: ruleId },
@@ -387,11 +495,15 @@ function toAuditSnapshot(r: RuleRow) {
       matchPriority: r.matchPriority,
       matchDepartment: r.matchDepartment,
       matchKeyword: r.matchKeyword,
+      matchComplexity: r.matchComplexity,
     },
     actions: {
       setAssigneeUserId: r.setAssigneeUserId,
       setPriority: r.setPriority,
       setSlaHours: r.setSlaHours,
+      setTeamId: r.setTeamId,
+      escalateToUserId: r.escalateToUserId,
+      requireApprovalFromUserId: r.requireApprovalFromUserId,
     },
   };
 }

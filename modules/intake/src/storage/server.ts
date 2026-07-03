@@ -36,8 +36,12 @@ import {
 } from "@aegis/db";
 import { evaluateRoutingRules } from "../routing/rules";
 import { loadEnabledRoutingRules, recordRuleFirings } from "../routing/server";
+import { buildPoolResolver } from "../routing/teams";
+import { deriveComplexity } from "../routing/complexity";
 import { maybeSpawnMatterForApprovedTicket } from "../matter-spawn/server";
 import { syncAgentDecisionForTicket } from "../agent-decision/server";
+import { buildAutoBatonRows } from "../handoff/auto";
+import { notifyTicketEvent } from "../notifications/server";
 
 // ── Storage keys (mirror modules/intake/src/storage/keys.js) ─────────
 const K_TICKETS = "aegis:tickets:v1";
@@ -75,6 +79,7 @@ function v8SourceToEnum(raw: string | undefined): IntakeSource {
   if (raw === "copilot") return IntakeSource.COPILOT;
   if (raw === "email") return IntakeSource.EMAIL;
   if (raw === "slack") return IntakeSource.SLACK;
+  if (raw === "teams") return IntakeSource.TEAMS;
   if (raw === "api") return IntakeSource.API;
   return IntakeSource.FORM;
 }
@@ -127,6 +132,9 @@ type V8Ticket = {
   triagedAt?: number | null;
   triagedAction?: string | null;
   agentProcessedAt?: number | null;
+  /** Item-1 wiring — the configured IntakeRequestType this ticket was
+   *  filed under (null for the built-in hardcoded types). */
+  requestTypeId?: string | null;
   /**
    * P2b — agent routing outcome the client stamps after running the
    * router: "matched" | "no-match". Drives the
@@ -147,6 +155,26 @@ type V8Ticket = {
    * server-side by the matter-spawn helper on first approval.
    */
   matterId?: string | null;
+  /**
+   * Item 6 / W2-2 — denormalized baton holder ("agent" | "human" |
+   * "queue") and the concrete person when human. Read-only for the
+   * client; written by the hand-off endpoint and the auto baton-pass.
+   */
+  handoffHolder?: string | null;
+  handoffUserId?: string | null;
+  /**
+   * W2-5 — approval gate: only this user may approve agent
+   * recommendations on the ticket. Read-only for the client; stamped
+   * by requireApprovalFrom routing rules, enforced server-side.
+   */
+  approvalGateUserId?: string | null;
+  approvalGateUserName?: string | null;
+  /**
+   * W3-3 — structured answers for the type's configured fields, keyed
+   * by IntakeRequestField.key. Undefined preserves the stored value;
+   * null/object writes through.
+   */
+  requestFieldValues?: Record<string, unknown> | null;
 };
 
 // ── Read path: assemble v8 ticket array from DB rows ─────────────────
@@ -158,6 +186,7 @@ async function loadTicketsV8(orgId: string): Promise<V8Ticket[]> {
       requester: true,
       recommendations: { orderBy: { createdAt: "desc" }, take: 1 },
       conversation: { orderBy: { timestamp: "asc" } },
+      approvalGateUser: { select: { name: true } },
     },
     orderBy: { submittedAt: "desc" },
   });
@@ -210,6 +239,13 @@ async function loadTicketsV8(orgId: string): Promise<V8Ticket[]> {
       agentProcessedAt: t.agentProcessedAt?.getTime() ?? null,
       firedRules: (t.firedRulesJson as unknown) ?? null,
       matterId: t.matterId ?? null,
+      requestTypeId: t.requestTypeId ?? null,
+      handoffHolder: t.handoffHolder ?? null,
+      handoffUserId: t.handoffUserId ?? null,
+      approvalGateUserId: t.approvalGateUserId ?? null,
+      approvalGateUserName: t.approvalGateUser?.name ?? null,
+      requestFieldValues:
+        (t.requestFieldValuesJson as Record<string, unknown> | null) ?? null,
     };
   });
 }
@@ -248,6 +284,13 @@ async function saveTicketsV8(
   // first firing of each rule per ticket.
   const routingRules = await loadEnabledRoutingRules(orgId);
 
+  // Item 5 (tiering) — if any enabled rule routes to a pool, build the
+  // load-balancing resolver once per save. `resolve` is a pure sync
+  // lookup passed into the evaluator; `commitPicks` advances the
+  // round-robin cursors after all tickets are evaluated.
+  const hasPoolRules = routingRules.some((r) => !!r.setTeamId);
+  const poolResolver = hasPoolRules ? await buildPoolResolver(orgId) : null;
+
   for (const t of tickets) {
     if (!t.id) continue;
     const submittedAt = t.submittedTs
@@ -267,6 +310,13 @@ async function saveTicketsV8(
         firedRulesJson: true,
         matterId: true,
         agentProcessedAt: true,
+        requestTypeId: true,
+        stageTimestampsJson: true,
+        handoffHolder: true,
+        handoffUserId: true,
+        approvalGateUserId: true,
+        triagedAt: true,
+        requestFieldValuesJson: true,
       },
     });
 
@@ -281,8 +331,28 @@ async function saveTicketsV8(
     // path. When no transition is happening, the prior value is
     // preserved verbatim.
     const incomingAction = t.triagedAction ?? null;
+
+    // W2-5 — approval gate (requireApprovalFrom rule action). When a
+    // gate user is stamped on the ticket, ONLY that user's session can
+    // land an approve / edited-approve transition. Anyone else's
+    // attempt is refused server-side: the triage fields revert to the
+    // pre-mutation state (the optimistic client resyncs on next load),
+    // the AgentDecision stays PENDING, and a chain-sealed audit row
+    // records who tried. Reject / reassign / snooze are NOT gated —
+    // the gate reserves the power to ship agent output, not to stop
+    // colleagues from flagging problems.
+    const gateUserId = before?.approvalGateUserId ?? null;
+    const attemptedApproval =
+      (incomingAction === "approved" || incomingAction === "edited-approved") &&
+      before?.triagedAction !== incomingAction;
+    const approvalBlocked =
+      !!gateUserId && attemptedApproval && demoUser.id !== gateUserId;
+    const effectiveAction = approvalBlocked
+      ? (before?.triagedAction ?? null)
+      : incomingAction;
+
     const isNewTriageTransition =
-      !!incomingAction && before?.triagedAction !== incomingAction;
+      !!effectiveAction && before?.triagedAction !== effectiveAction;
     const authoritativeTriagedBy = isNewTriageTransition
       ? demoUser.name
       : (before?.triagedBy ?? t.triagedBy ?? null);
@@ -299,7 +369,7 @@ async function saveTicketsV8(
     const common = {
       type: t.type ?? "",
       priority: t.priority ?? "Medium",
-      status: v8StatusToEnum(t.status),
+      status: approvalBlocked ? (before?.status ?? v8StatusToEnum(t.status)) : v8StatusToEnum(t.status),
       stage: t.stage ?? "new",
       description: t.desc ?? "",
       slaHours: t.slaHours ?? 24,
@@ -310,9 +380,29 @@ async function saveTicketsV8(
       aiTriageJson: (t.aiTriage ?? null) as never,
       workflowJson: (t.workflow ?? []) as never,
       triagedBy: authoritativeTriagedBy,
-      triagedAt: t.triagedAt ? new Date(t.triagedAt) : null,
-      triagedAction: incomingAction,
+      triagedAt: approvalBlocked
+        ? (before?.triagedAt ?? null)
+        : t.triagedAt
+          ? new Date(t.triagedAt)
+          : null,
+      triagedAction: effectiveAction,
       agentProcessedAt: t.agentProcessedAt ? new Date(t.agentProcessedAt) : null,
+      // Item-1 wiring — configured request type. Undefined preserves the
+      // stored value (stale clients that don't send the field can't
+      // clear it); null/value writes through.
+      requestTypeId:
+        t.requestTypeId !== undefined
+          ? t.requestTypeId
+          : (before?.requestTypeId ?? null),
+      // W3-3 — structured field answers; same undefined-preserving
+      // semantics as requestTypeId.
+      requestFieldValuesJson: (t.requestFieldValues !== undefined
+        ? t.requestFieldValues
+        : (before?.requestFieldValuesJson ?? null)) as never,
+      // Server-owned (W1-5 advance endpoint writes it); preserve.
+      stageTimestampsJson: (before?.stageTimestampsJson ?? null) as never,
+      // Server-owned (W2-5 requireApprovalFrom rules write it); preserve.
+      approvalGateUserId: (before?.approvalGateUserId ?? null) as string | null,
       // Server-computed below; the client's copy is never trusted.
       firedRulesJson: (before?.firedRulesJson ?? null) as never,
     };
@@ -327,21 +417,42 @@ async function saveTicketsV8(
       summaries?: Array<{ id: string; name: string; actions: string[] }>;
     } | null;
     let newlyFired: Array<{ id: string; name: string; actions: string[] }> = [];
-    if (!incomingAction && !authoritativeTriagedBy && routingRules.length > 0) {
-      const { patch, fired } = evaluateRoutingRules(routingRules, {
-        type: common.type,
-        priority: common.priority,
-        department: common.department,
-        description: common.description,
-        slaHours: common.slaHours,
-        assignedToUserId: common.assignedToUserId,
-      });
+    // W2-1 — derive the complexity band from the triage signal, stamp
+    // it onto aiTriage for display, and feed it to the rule engine.
+    const triageSignal = (t.aiTriage ?? null) as {
+      riskFlag?: string; confidence?: number; estimatedHours?: number; complexity?: string;
+    } | null;
+    const complexity = deriveComplexity(triageSignal);
+    if (triageSignal && triageSignal.complexity !== complexity) {
+      common.aiTriageJson = { ...triageSignal, complexity } as never;
+    }
+    if (!effectiveAction && !authoritativeTriagedBy && routingRules.length > 0) {
+      const { patch, fired } = evaluateRoutingRules(
+        routingRules,
+        {
+          type: common.type,
+          priority: common.priority,
+          department: common.department,
+          description: common.description,
+          slaHours: common.slaHours,
+          assignedToUserId: common.assignedToUserId,
+          complexity,
+          approvalGateUserId: common.approvalGateUserId,
+        },
+        poolResolver ? { resolvePool: poolResolver.resolve } : {},
+      );
       if (fired.length > 0) {
         if (patch.priority !== undefined) common.priority = patch.priority;
         if (patch.slaHours !== undefined) common.slaHours = patch.slaHours;
         if (patch.assignedToUserId !== undefined)
           common.assignedToUserId = patch.assignedToUserId;
         if (patch.assignedTo !== undefined) common.assignedTo = patch.assignedTo;
+        // W2-5 — escalate flips the ticket to ESCALATED (the status-
+        // boundary audit below fires on the transition); the approval
+        // gate stamps the required approver onto the ticket.
+        if (patch.escalated) common.status = IntakeStatus.ESCALATED;
+        if (patch.approvalGateUserId !== undefined)
+          common.approvalGateUserId = patch.approvalGateUserId;
         const priorIds = new Set(priorFired?.ruleIds ?? []);
         newlyFired = fired.filter((f) => !priorIds.has(f.id));
         common.firedRulesJson = {
@@ -448,6 +559,14 @@ async function saveTicketsV8(
         resourceId: t.id,
         afterJson: { status: newStatus, source: t._source ?? "form" },
       });
+      // W3-2 — routing may have assigned someone at creation; tell them.
+      if (common.assignedToUserId) {
+        await notifyTicketEvent({
+          organizationId: orgId,
+          ticketId: t.id,
+          kind: "assignment",
+        });
+      }
     } else {
       // Phase 1b — assignment transitions (typed FK only; free-text
       // edits don't fire the audit because they aren't a structural
@@ -468,6 +587,14 @@ async function saveTicketsV8(
           beforeJson: { assignedToUserId: before.assignedToUserId ?? null },
           afterJson: { assignedToUserId: common.assignedToUserId ?? null },
         });
+        // W3-2 — tell the new assignee (best-effort; never throws).
+        if (common.assignedToUserId) {
+          await notifyTicketEvent({
+            organizationId: orgId,
+            ticketId: t.id,
+            kind: "assignment",
+          });
+        }
       }
       // Phase 1b — stage transitions. Stage is the Kanban-column
       // dimension; promoting from "new" → "triage" → "assigned" →
@@ -482,6 +609,30 @@ async function saveTicketsV8(
           resourceId: t.id,
           beforeJson: { stage: before.stage ?? null },
           afterJson: { stage: common.stage ?? null },
+        });
+        // W3-2 — tell the requester their request moved forward.
+        await notifyTicketEvent({
+          organizationId: orgId,
+          ticketId: t.id,
+          kind: "stage",
+        });
+      }
+      // W2-5 — refused approval attempt (approval gate). The mutation
+      // was already reverted above; this row is the evidence.
+      if (approvalBlocked) {
+        await logAudit({
+          organizationId: orgId,
+          actorId: actor,
+          actorType: "USER",
+          action: "intake.recommendation.approval_blocked",
+          resourceType: "IntakeTicket",
+          resourceId: t.id,
+          beforeJson: { triagedAction: before.triagedAction ?? null },
+          afterJson: {
+            attemptedAction: incomingAction,
+            requiredApproverId: gateUserId,
+          },
+          metadata: { source: "approval-gate" },
         });
       }
       // Status transitions that cross a meaningful boundary.
@@ -507,6 +658,12 @@ async function saveTicketsV8(
           resourceId: t.id,
           beforeJson: { status: before.status },
           afterJson: { status: newStatus, triagedAction: newAction },
+        });
+        // W3-2 — tell the requester their request is resolved.
+        await notifyTicketEvent({
+          organizationId: orgId,
+          ticketId: t.id,
+          kind: "closure",
         });
       }
       // Recommendation review actions — only fire when triagedAction
@@ -645,6 +802,10 @@ async function saveTicketsV8(
     }
 
     // Replace recommendation if present.
+    // W2-2 — captured so the auto baton-pass below can link the pass to
+    // the governing AgentDecision (one record ties the review gate and
+    // the custody hand-off together).
+    let pendingDecisionId: string | null = null;
     if (t.agentRecommendation && t.agentRecommendation.agentId) {
       const r = t.agentRecommendation;
       // Map the ticket's triagedAction onto the rec's review status —
@@ -679,13 +840,80 @@ async function saveTicketsV8(
       // save (no triage action yet). Idempotent: syncAgentDecision
       // no-ops if a decision already exists.
       if (recStatus === AgentRecommendationStatus.PENDING) {
-        await syncAgentDecisionForTicket({
+        const sync = await syncAgentDecisionForTicket({
           organizationId: orgId,
           ticketId: t.id,
           rec: r,
           action: null,
         });
+        pendingDecisionId = sync.decision?.id ?? null;
       }
+    }
+
+    // W2-2 — auto baton-pass (issue #109). On the same first-processing
+    // transition as the no-match audit above, the agent pipeline writes
+    // its own chain of custody: (prior → agent) while the agent worked,
+    // then (agent → assignee|queue) when the draft landed — or
+    // (agent → queue) when no agent matched. Nobody remembers to log
+    // it; the ledger populates itself. Deduped by the becameProcessed
+    // transition, so re-saves never double-write. AGENT actor rows
+    // (actorId null) — the pipeline, not the session user, moved the
+    // baton. One summarizing chain-sealed audit row covers both passes.
+    if (becameProcessed) {
+      const outcome =
+        t.agentRecommendation?.agentId ? ("drafted" as const) : ("no-match" as const);
+      const plan = buildAutoBatonRows({
+        currentHolder: before?.handoffHolder ?? null,
+        assignedToUserId: common.assignedToUserId ?? null,
+        outcome,
+      });
+      for (const [i, row] of plan.rows.entries()) {
+        await prisma.intakeTicketHandoff.create({
+          data: {
+            ticketId: t.id,
+            fromHolder: row.fromHolder,
+            toHolder: row.toHolder,
+            toUserId: row.toUserId,
+            reason: row.reason,
+            actorId: null,
+            actorType: "AGENT",
+            // The final pass (the one that queues the draft for review)
+            // links the governing AgentDecision when one was created.
+            agentDecisionId:
+              i === plan.rows.length - 1 ? pendingDecisionId : null,
+          },
+        });
+      }
+      await prisma.intakeTicket.update({
+        where: { id: t.id },
+        data: {
+          handoffHolder: plan.finalHolder,
+          handoffUserId: plan.finalUserId,
+          handoffUpdatedAt: new Date(),
+        },
+      });
+      await logAudit({
+        organizationId: orgId,
+        actorId: null,
+        actorType: "AGENT",
+        action: "intake.ticket.handoff",
+        resourceType: "IntakeTicket",
+        resourceId: t.id,
+        beforeJson: {
+          holder: before?.handoffHolder ?? null,
+          holderUserId: before?.handoffUserId ?? null,
+        },
+        afterJson: {
+          holder: plan.finalHolder,
+          holderUserId: plan.finalUserId,
+        },
+        metadata: {
+          auto: "agent-pipeline",
+          outcome,
+          passes: plan.rows.length,
+          agentDecisionId: pendingDecisionId,
+        },
+      });
     }
 
     // Replace conversation if present.
@@ -704,6 +932,8 @@ async function saveTicketsV8(
       }
     }
   }
+  // Item 5 — advance round-robin cursors for pool members picked this pass.
+  if (poolResolver) await poolResolver.commitPicks();
   return { spawnedMatters };
 }
 

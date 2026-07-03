@@ -67,7 +67,9 @@ model Organization {
   legalHolds     LegalHold[]
   intakeTickets  IntakeTicket[]
   intakeRoutingRules IntakeRoutingRule[]
+  intakeTeams    IntakeTeam[]
   intakeEmailMailboxes IntakeEmailMailbox[]
+  intakeRequestTypes IntakeRequestType[]
   vendors        Vendor[]
   budgets        Budget[]
   dsars          DataSubjectRequest[]
@@ -122,7 +124,11 @@ model User {
   preferences  UserPreference[]
 
   intakeTicketsAssigned         IntakeTicket[]        @relation("IntakeTicketAssignee")
+  intakeTicketsApprovalGate     IntakeTicket[]        @relation("IntakeTicketApprovalGate")
   intakeRoutingRulesAssigned    IntakeRoutingRule[]   @relation("IntakeRoutingRuleAssignee")
+  intakeRoutingRulesEscalateTo  IntakeRoutingRule[]   @relation("IntakeRoutingRuleEscalateTo")
+  intakeRoutingRulesApprover    IntakeRoutingRule[]   @relation("IntakeRoutingRuleApprover")
+  intakeTeamMemberships         IntakeTeamMember[]    @relation("IntakeTeamMembership")
   legalHoldsCreated             LegalHold[]           @relation("LegalHoldCreatedBy")
   legalHoldsReleased            LegalHold[]           @relation("LegalHoldReleasedBy")
   legalHoldEvents               LegalHoldEvent[]      @relation("LegalHoldEventActor")
@@ -243,6 +249,7 @@ model Counterparty {
 
   matters Matter[]
   vendors Vendor[]
+  intakeTicketParties IntakeTicketParty[]
   // Persons attached to this counterparty as contacts (Person.type = COUNTERPARTY_CONTACT,
   // metadata.counterpartyId = this id). Not modeled as FK to keep Person polymorphic.
 
@@ -286,6 +293,7 @@ model Person {
   invoiceLineItems    InvoiceLineItem[]
   dsarRequests        DataSubjectRequest[]
   consentRecords      ConsentRecord[]
+  intakeTicketParties IntakeTicketParty[]
 
   @@index([organizationId, email])
   @@index([organizationId, externalRef])
@@ -1222,6 +1230,8 @@ enum IntakeSource {
   EMAIL
   SLACK
   API
+  /// W3-1 — filed from a Microsoft Teams channel (outgoing webhook).
+  TEAMS
 }
 
 enum IntakeStatus {
@@ -1287,6 +1297,39 @@ model IntakeTicket {
   /// are distinct in Postgres, so unscoped channels are unaffected).
   externalMessageId String?
 
+  /// Phase 1 — the configurable request type this ticket was filed under
+  /// (IntakeRequestType). Null for tickets filed before types existed /
+  /// via the legacy free-text `type`. `requestFieldValuesJson` holds the
+  /// structured field values keyed by IntakeRequestField.key.
+  requestTypeId          String?
+  requestFieldValuesJson Json?
+
+  /// Phase 1 — delivery/work status, distinct from the request `status`.
+  /// The request lifecycle answers "where is this in triage"; workStatus
+  /// answers "how is delivery going" (e.g. Not started / In progress /
+  /// Blocked / Delivered). Set by the assigned team, not the router.
+  workStatus String?
+
+  /// W1-5 — append-only [{stage, at}] stamps written on each server-
+  /// enforced stage advancement. Feeds per-stage TAT and the multi-leg
+  /// SLA legs (W2-4).
+  stageTimestampsJson Json?
+
+  /// Item 6 — hand-off baton: who currently "holds" the ticket.
+  /// "agent" (AI is processing) | "human" (a person owns it) | "queue"
+  /// (waiting for pickup). Denormalized current holder; the source of
+  /// truth is the append-only IntakeTicketHandoff log. Null until the
+  /// first hand-off is recorded.
+  handoffHolder    String?
+  /// The concrete person holding the baton when handoffHolder="human".
+  handoffUserId    String?
+  handoffUpdatedAt DateTime?
+
+  /// W2-5 — approval gate. When set (by a requireApprovalFrom routing
+  /// rule), only this user may approve agent recommendations on the
+  /// ticket; the save chokepoint blocks + audits any other approver.
+  approvalGateUserId String?
+
   submittedAt DateTime @default(now())
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -1295,9 +1338,14 @@ model IntakeTicket {
   requester    Person       @relation("IntakeRequester", fields: [requesterId], references: [id], onDelete: Cascade)
   matter       Matter?      @relation(fields: [matterId], references: [id], onDelete: SetNull)
   assignedToUser User?      @relation("IntakeTicketAssignee", fields: [assignedToUserId], references: [id], onDelete: SetNull)
+  approvalGateUser User?    @relation("IntakeTicketApprovalGate", fields: [approvalGateUserId], references: [id], onDelete: SetNull)
 
   recommendations AgentRecommendation[]
   conversation    IntakeConversation[]
+  assignments     IntakeTicketAssignment[]
+  tasks           IntakeTicketTask[]
+  parties         IntakeTicketParty[]
+  handoffs        IntakeTicketHandoff[]
 
   @@index([organizationId, status])
   @@index([organizationId, priority])
@@ -1332,11 +1380,28 @@ model IntakeRoutingRule {
   matchDepartment String?
   /// Case-insensitive substring on the ticket description.
   matchKeyword    String?
+  /// W2-1 — complexity band from the classifier/agent signal:
+  /// "simple" | "standard" | "complex".
+  matchComplexity String?
 
   // ── Actions (null = no-op) ──
   setAssigneeUserId String?
   setPriority       String?
   setSlaHours       Int?
+  /// W2-5 — escalate action: assign to the named user, raise priority
+  /// to Critical (unless the rule sets one explicitly), and flip the
+  /// ticket to ESCALATED. Route + raise in one rule.
+  escalateToUserId String?
+  /// W2-5 — approval gate: stamps IntakeTicket.approvalGateUserId so
+  /// only the named user can approve agent recommendations on matched
+  /// tickets. The save chokepoint enforces + audits the gate.
+  requireApprovalFromUserId String?
+  /// Item 5 (tiering) — route to a team/pool. The engine load-balances
+  /// within the pool at fire time (least-loaded / round-robin) and
+  /// overflows to the pool's `overflowTeam` when every member is at
+  /// capacity. Mutually complements `setAssigneeUserId`: a direct
+  /// assignee wins over a pool pick when both are set on one rule.
+  setTeamId         String?
 
   /// Effectiveness counters for the SLA Operations view.
   timesFired  Int       @default(0)
@@ -1347,8 +1412,65 @@ model IntakeRoutingRule {
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   assignee     User?        @relation("IntakeRoutingRuleAssignee", fields: [setAssigneeUserId], references: [id], onDelete: SetNull)
+  team         IntakeTeam?  @relation("IntakeRoutingRuleTeam", fields: [setTeamId], references: [id], onDelete: SetNull)
+  escalateTo   User?        @relation("IntakeRoutingRuleEscalateTo", fields: [escalateToUserId], references: [id], onDelete: SetNull)
+  approver     User?        @relation("IntakeRoutingRuleApprover", fields: [requireApprovalFromUserId], references: [id], onDelete: SetNull)
 
   @@index([organizationId, enabled, evalOrder])
+}
+
+/// Item 5 (tiering) — a routing pool. DRL's competency/seniority tiers
+/// are modelled as teams: a routing rule points at a team, and the
+/// engine load-balances the ticket across the team's active members,
+/// overflowing to `overflowTeam` when all members are at capacity.
+model IntakeTeam {
+  id             String  @id @default(cuid())
+  organizationId String
+  /// Stable slug, unique per org (e.g. "contracts-senior").
+  key            String
+  name           String
+  description    String?
+  active         Boolean @default(true)
+  /// Load-balancing strategy within the pool.
+  /// "least_loaded" (default) | "round_robin".
+  strategy       String  @default("least_loaded")
+  /// Overflow target when every active member is at/over capacity.
+  /// Null = no overflow (ticket stays unassigned for manual pickup).
+  overflowTeamId String?
+  sortOrder      Int     @default(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  overflowTeam IntakeTeam?         @relation("IntakeTeamOverflow", fields: [overflowTeamId], references: [id], onDelete: SetNull)
+  overflowOf   IntakeTeam[]        @relation("IntakeTeamOverflow")
+  members      IntakeTeamMember[]
+  routingRules IntakeRoutingRule[] @relation("IntakeRoutingRuleTeam")
+
+  @@unique([organizationId, key])
+  @@index([organizationId, active, sortOrder])
+}
+
+/// A member of an intake pool. `capacity` is the max concurrent open
+/// tickets before the member is considered "at capacity" (0 =
+/// unbounded). `lastAssignedAt` is the round-robin cursor.
+model IntakeTeamMember {
+  id       String  @id @default(cuid())
+  teamId   String
+  userId   String
+  capacity Int     @default(0)
+  active   Boolean @default(true)
+  lastAssignedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team IntakeTeam @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User       @relation("IntakeTeamMembership", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([teamId, active])
 }
 
 /// P4b — a Microsoft 365 mailbox AEGIS polls for inbound intake email.
@@ -1380,6 +1502,160 @@ model IntakeEmailMailbox {
 
   @@unique([organizationId, address])
   @@index([organizationId, enabled])
+}
+
+/// Phase 1 — configurable request type (workstream) for intake. Mirrors
+/// MatterTypeConfig: the container that lets a client define their own
+/// request catalog (NDAs, contracts, trademarks, litigation, DPIA,
+/// notices, …) with structured fields and a stage workflow. The specific
+/// field sets per client are configuration, filled in post-discovery.
+model IntakeRequestType {
+  id             String  @id @default(cuid())
+  organizationId String
+  /// Stable machine key, unique per org, e.g. "litigation-noncourt".
+  key            String
+  name           String
+  /// High-level grouping, e.g. "Contracts", "Trademarks", "Litigation".
+  workstream     String?
+  description    String?
+  active         Boolean @default(true)
+  /// Ordered stage names for this type's workflow, e.g.
+  /// ["Intake","Triage","Assigned","In Review","Complete"].
+  stagesJson     Json    @default("[]")
+  /// Display order in pickers.
+  sortOrder      Int     @default(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  fields       IntakeRequestField[]
+
+  @@unique([organizationId, key])
+  @@index([organizationId, active])
+}
+
+/// A structured field on a request type (the intake form schema). Client-
+/// specific field sets are configuration authored via the admin API.
+model IntakeRequestField {
+  id            String  @id @default(cuid())
+  requestTypeId String
+  /// Machine key, unique within the type, e.g. "adverse_party".
+  key           String
+  label         String
+  /// text | textarea | select | date | number | boolean
+  kind          String  @default("text")
+  required      Boolean @default(false)
+  sortOrder     Int     @default(100)
+  /// Options for select kinds: array of {value,label}.
+  optionsJson   Json    @default("[]")
+
+  requestType IntakeRequestType @relation(fields: [requestTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([requestTypeId, key])
+  @@index([requestTypeId, sortOrder])
+}
+
+/// Phase 1 — who is involved in DELIVERING a ticket. Multiple people can
+/// be assigned to one ticket, each in a role (lead / reviewer / support /
+/// senior-counsel). Coexists with the single free-text `assignedTo` and
+/// the typed `assignedToUserId` (the primary owner). `userId` is an
+/// application-level reference to User.id (no FK, same pattern as
+/// AuditLog.actorId) so the tier/pool model can populate it without a
+/// User back-relation.
+model IntakeTicketAssignment {
+  id           String   @id @default(cuid())
+  ticketId     String
+  userId       String
+  role         String   @default("support")
+  assignedAt   DateTime @default(now())
+  assignedById String? // User id who made the assignment
+
+  ticket IntakeTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@unique([ticketId, userId, role])
+  @@index([ticketId])
+  @@index([userId])
+}
+
+/// Phase 1 — sub-tasks that make up the delivery of a ticket ("how
+/// delivery is happening"): who is doing what and its status. This is the
+/// work-in-progress layer beneath the request.
+model IntakeTicketTask {
+  id             String   @id @default(cuid())
+  ticketId       String
+  title          String
+  description    String?
+  assigneeUserId String? // application-level User.id reference
+  /// open | in_progress | blocked | done
+  status         String   @default("open")
+  sortOrder      Int      @default(100)
+  /// W3-5 — cumulative logged effort, minutes. Each log increment is
+  /// audited (intake.task.effort_logged) so the per-entry ledger lives
+  /// on the chain; this column is the fast-read total.
+  effortMinutes  Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  ticket IntakeTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, sortOrder])
+  @@index([assigneeUserId])
+}
+
+/// Phase 1 — who is involved in a ticket, drawn from the SHARED entities
+/// (Person / Counterparty) with a role. This is how litigation intake
+/// (and others) record the adverse party, opposing / our counsel,
+/// witnesses, etc. — reusing the one-brain entities rather than a
+/// ticket-local party table. Exactly one of personId / counterpartyId is
+/// set per row.
+model IntakeTicketParty {
+  id             String  @id @default(cuid())
+  ticketId       String
+  personId       String?
+  counterpartyId String?
+  /// adverse_party | opposing_counsel | our_counsel | witness |
+  /// requester | third_party | other
+  role           String  @default("other")
+  note           String?
+  createdAt      DateTime @default(now())
+
+  ticket       IntakeTicket  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  person       Person?       @relation(fields: [personId], references: [id], onDelete: SetNull)
+  counterparty Counterparty? @relation(fields: [counterpartyId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId])
+  @@index([personId])
+  @@index([counterpartyId])
+}
+
+/// Item 6 — append-only baton-pass log. Every hand-off between an AI
+/// agent and a human (or across human tiers) writes one row; the
+/// ticket's denormalized `handoffHolder` / `handoffUserId` are a
+/// fast-read materialization of the latest row. A hand-off that
+/// escalates an agent recommendation for review links the governing
+/// `AgentDecision` so the review gate and the baton are one record.
+model IntakeTicketHandoff {
+  id       String  @id @default(cuid())
+  ticketId String
+  /// Prior holder ("agent" | "human" | "queue"); null on the first pass.
+  fromHolder String?
+  /// New holder ("agent" | "human" | "queue").
+  toHolder   String
+  /// Concrete person receiving the baton when toHolder="human".
+  toUserId   String?
+  reason     String?
+  /// Actor who performed the hand-off. Null actorId for AGENT / SYSTEM.
+  actorId    String?
+  /// "USER" | "AGENT" | "SYSTEM".
+  actorType  String  @default("USER")
+  /// The AgentDecision this hand-off relates to, when it gates a rec.
+  agentDecisionId String?
+  createdAt  DateTime @default(now())
+
+  ticket IntakeTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
 }
 
 enum AgentRecommendationStatus {

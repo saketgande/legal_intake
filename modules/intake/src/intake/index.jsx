@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { C, F, M, SR, Pill, Dot, Bar, Card, SH, WorkflowSteps, pc, inputStyle, FormField } from "@aegis/ui";
+import { C, F, M, SR, Pill, Dot, Bar, Card, SH, WorkflowSteps, pc, inputStyle, FormField, PanelBoundary, useToast, useIsNarrow, pressable } from "@aegis/ui";
 import { classifyIntakeRegex } from "@aegis/ai";
 import { useCurrentUser } from "@aegis/auth/react";
 import { Kbd, ConfidenceBadge, AgentBadge, TypingDots, ChatBubble, CapacityMeter, SimilarMatterCard } from "../intake-ui";
@@ -15,6 +15,19 @@ import { useAgentLog } from "../hooks/use-agent-log";
 import { useKeyboardShortcuts } from "../hooks/use-keyboard-shortcuts";
 import { TicketSummaryButton, AskAuroraChat } from "../ai-features";
 import { isAwaitingTriage } from "./triage-filter";
+import { TeamsTab } from "./teams-admin";
+import { HandoffDialog } from "./handoff-dialog";
+import { WorkPanel } from "./work-panel";
+import { PartiesPanel } from "./parties-panel";
+import { LitigationSummaryCard } from "./litigation-view";
+import { RequestTypesTab } from "./request-types-admin";
+import { MyWorkTab } from "./my-work";
+import { MyRequestsTab } from "./my-requests";
+import { PoolOpsTab } from "./pool-ops";
+import { DynamicFields, missingRequiredFields, fieldValuesToLines, RequestFieldValues } from "./request-fields";
+import { upload as blobUpload } from "@vercel/blob/client";
+import { TicketTimelinePanel } from "./timeline-panel";
+import { SlaLegsPanel } from "./sla-legs-panel";
 
 // Type picker gate — shown at top of New Request tab
 // Splits simple vs complex request types into Form path vs Copilot path.
@@ -87,6 +100,8 @@ function CopilotChat({initialType,onFiled,onSwitchToForm,store,settings}){
   // from the Auth0-resolved user; the field stays editable so a user
   // filing on behalf of someone else can override.
   const{user:sessionUser}=useCurrentUser();
+  const toast=useToast();
+  const phone=useIsNarrow(760); // W4-3 — sidebar stacks under the chat
   const[state,setState]=useState(()=>({...COPILOT_INITIAL_STATE(),requestType:initialType}));
   const[history,setHistory]=useState(()=>[{role:"assistant",content:initialAssistantMessage(initialType),ts:Date.now()}]);
   const[input,setInput]=useState("");
@@ -162,7 +177,7 @@ function CopilotChat({initialType,onFiled,onSwitchToForm,store,settings}){
 
   const submit=async(overrideReady)=>{
     if(submitting) return;
-    if(!requesterName.trim()){ alert("Please enter your name before submitting."); return; }
+    if(!requesterName.trim()){ toast.error("Please enter your name before submitting."); return; }
     setSubmitting(true);
     try{
       const transcript=history.map(m=>({role:m.role,content:m.content,ts:m.ts,...(m.fieldsExtracted?{fieldsExtracted:m.fieldsExtracted}:{})}));
@@ -207,7 +222,7 @@ function CopilotChat({initialType,onFiled,onSwitchToForm,store,settings}){
     </div>;
   }
 
-  return <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:14,maxWidth:1100,margin:"0 auto"}}>
+  return <div style={{display:"grid",gridTemplateColumns:phone?"1fr":"2fr 1fr",gap:14,maxWidth:1100,margin:"0 auto"}}>
     {/* Left: chat */}
     <div>
       <div style={{background:C.cd,border:`1px solid ${C.br}`,borderLeft:`3px solid ${C.em}`,borderRadius:6,padding:12,marginBottom:10}}>
@@ -306,7 +321,17 @@ function CopilotChat({initialType,onFiled,onSwitchToForm,store,settings}){
 // Note: in the standalone demo file, we ship a compact v7-form-compatible version here so the file
 // runs alone. On splice, this replaces the existing NewRequestTab — the legacy form body moves
 // from v7 (lines 1512–1712) into <LegacyFormInner/> verbatim.
-function NewRequestV8({store,goToInbox,goToCockpit,settings,prefillDesc}){
+function NewRequestV8({store,goToInbox,goToCockpit,goToMyRequests,settings,prefillDesc}){
+  const phone=useIsNarrow(640); // W4-3 — single-column form on phones
+  // W4-6 — upload path capability: "direct" (Vercel Blob connected,
+  // 25 MB, original bytes retained) or "inline" (base64 JSON, 3 MB).
+  const[uploadMode,setUploadMode]=useState({mode:"inline",maxBytes:MAX_UPLOAD_BYTES});
+  useEffect(()=>{
+    let on=true;
+    fetch("/api/intake/documents/upload-mode").then(r=>r.ok?r.json():null)
+      .then(d=>{ if(on&&d?.ok&&d.mode) setUploadMode({mode:d.mode,maxBytes:d.maxBytes}); }).catch(()=>{});
+    return()=>{ on=false; };
+  },[]);
   // If we arrive with a pre-filled description (from "File a ticket" in
   // Ask Aurora), skip the picker and go straight to the legacy form so
   // the user sees their question already in the description box.
@@ -337,13 +362,18 @@ function NewRequestV8({store,goToInbox,goToCockpit,settings,prefillDesc}){
       <span onClick={()=>setMode("picker")} style={{display:"inline-flex",alignItems:"center",gap:4,cursor:"pointer",fontSize:10.5,color:C.cy,padding:"3px 6px",fontFamily:M,letterSpacing:1,textTransform:"uppercase"}}>← Change path</span>
       <span onClick={()=>setMode("copilot")} style={{marginLeft:14,display:"inline-flex",alignItems:"center",gap:4,cursor:"pointer",fontSize:10.5,color:C.em,padding:"3px 6px",fontFamily:M,letterSpacing:1,textTransform:"uppercase"}}>⇄ Switch to Copilot</span>
     </div>
-    <LegacyFormInner store={store} initialType={initialType} initialDesc={prefillDesc} goToInbox={goToInbox} settings={settings}/>
+    <LegacyFormInner store={store} initialType={initialType} initialDesc={prefillDesc} goToInbox={goToInbox} goToMyRequests={goToMyRequests} settings={settings}/>
   </div>;
 }
 
 // ── Compact v7-compatible form for the standalone demo.
 //    On integration with aegis-v7-aurora.jsx, this is replaced by the real v7.2 NewRequestTab
 //    (lines 1512–1712 in v7), just re-routed through the v8 addTicketAndRunAgent path.
+// Honest client-side upload ceiling. Mirrors MAX_DOCUMENT_BYTES on the
+// server (documents/server.ts): ~3 MB decoded keeps the base64 JSON body
+// under the 4.5 MB serverless request cap. Keep the two in sync.
+const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
+
 // Read a File as bare base64 (strips the data: URL prefix).
 function fileToBase64(file){
   return new Promise((resolve,reject)=>{
@@ -354,7 +384,7 @@ function fileToBase64(file){
   });
 }
 
-function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
+function LegacyFormInner({store,initialType,initialDesc,goToInbox,goToMyRequests,settings}){
   // Session-resolved default for the requester `from` field. Same
   // pattern as CopilotChat: pre-fill, leave editable. Phase 1a.
   const{user:sessionUser}=useCurrentUser();
@@ -375,16 +405,59 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
   const[docBusy,setDocBusy]=useState(false);
   const[docErr,setDocErr]=useState(null);
 
+  // Item-1 wiring — ACTIVE configured request types (admin-defined
+  // workstreams). They merge into the type grid below; picking one
+  // stamps requestTypeId on the ticket and previews its stage workflow.
+  // Empty/unreachable → the built-in list alone (demo-safe fallback).
+  const[reqTypes,setReqTypes]=useState([]);
+  useEffect(()=>{
+    let on=true;
+    fetch("/api/intake/request-types").then(r=>r.json())
+      .then(d=>{ if(on&&d.ok) setReqTypes(d.types||[]); }).catch(()=>{});
+    return()=>{on=false;};
+  },[]);
+  const selectedReqType=reqTypes.find(rt=>rt.name===form.type)||null;
+  // W3-3 — structured answers for the selected type's configured
+  // fields. Reset when the type changes (different fields, clean slate).
+  const[fieldValues,setFieldValues]=useState({});
+  const selectedReqTypeId=selectedReqType?selectedReqType.id:null;
+  useEffect(()=>{ setFieldValues({}); },[selectedReqTypeId]);
+
   const onPickFile=async(e)=>{
     const file=e.target.files&&e.target.files[0];
     e.target.value=""; // allow re-picking the same filename
     if(!file) return;
-    setDocErr(null); setDocBusy(true);
+    setDocErr(null);
+    // Pre-flight size guard against the active path's honest ceiling:
+    // inline rides base64 through a JSON body (serverless caps the
+    // request at 4.5 MB → ~3 MB decoded); direct streams the original
+    // bytes to blob storage (25 MB). Reject before the network call so
+    // the user gets an instant, clear message, never a platform 413.
+    if(file.size>uploadMode.maxBytes){
+      setDocErr(`"${file.name}" is ${(file.size/1024/1024).toFixed(1)} MB — max ${Math.round(uploadMode.maxBytes/1024/1024)} MB. Upload a smaller file or paste the text into the description.`);
+      return;
+    }
+    setDocBusy(true);
     try{
-      const contentBase64=await fileToBase64(file);
-      const resp=await fetch("/api/intake/documents/upload",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({filename:file.name,mimeType:file.type,contentBase64,ticketId})});
-      const data=await resp.json().catch(()=>({}));
-      if(!resp.ok||!data.ok) throw new Error(data.error||`Upload failed (HTTP ${resp.status})`);
+      let data;
+      if(uploadMode.mode==="direct"){
+        // W4-6 — original bytes go straight to blob storage (the token
+        // broker gates + constrains the upload), then finalize extracts
+        // the text server-side and writes the Document row.
+        const blob=await blobUpload(file.name,file,{access:"public",handleUploadUrl:"/api/intake/documents/blob-upload"});
+        const resp=await fetch("/api/intake/documents/finalize",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({url:blob.url,filename:file.name,mimeType:file.type,ticketId})});
+        data=await resp.json().catch(()=>({}));
+        if(!resp.ok||!data.ok) throw new Error(data.error||`Upload failed (HTTP ${resp.status}).`);
+      }else{
+        const contentBase64=await fileToBase64(file);
+        const resp=await fetch("/api/intake/documents/upload",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({filename:file.name,mimeType:file.type,contentBase64,ticketId})});
+        // A 413 from the platform/framework may not carry a JSON body.
+        if(resp.status===413){
+          throw new Error(`"${file.name}" is too large to upload. Max ${MAX_UPLOAD_BYTES/1024/1024} MB — upload a smaller file or paste the text.`);
+        }
+        data=await resp.json().catch(()=>({}));
+        if(!resp.ok||!data.ok) throw new Error(data.error||`Upload failed (HTTP ${resp.status}).`);
+      }
       setDocs(d=>[...d,{documentId:data.documentId,name:data.name,charCount:data.charCount,text:data.text||"",format:data.format}]);
     }catch(err){ setDocErr(String(err.message||err)); }
     finally{ setDocBusy(false); }
@@ -392,11 +465,15 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
   const removeDoc=(id)=>setDocs(d=>d.filter(x=>x.documentId!==id));
 
   // The text the classifier + agent see: typed description plus the
-  // extracted text of every attached document.
+  // structured field answers (W3-3) plus the extracted text of every
+  // attached document.
+  const fieldLines=selectedReqType?fieldValuesToLines(selectedReqType.fields,fieldValues):[];
+  const descWithFields=fieldLines.length?`${form.desc.trim()}\n\n[Request details]\n${fieldLines.join("\n")}`:form.desc;
   const effectiveDesc=docs.length
-    ? [form.desc.trim(),...docs.map(d=>`--- Attached document: ${d.name} ---\n${d.text}`)].filter(Boolean).join("\n\n")
-    : form.desc;
-  const canSubmit=!!form.from&&(form.desc.length>=10||docs.length>0)&&!busy&&!docBusy;
+    ? [descWithFields.trim(),...docs.map(d=>`--- Attached document: ${d.name} ---\n${d.text}`)].filter(Boolean).join("\n\n")
+    : descWithFields;
+  const missingFields=selectedReqType?missingRequiredFields(selectedReqType.fields,fieldValues):[];
+  const canSubmit=!!form.from&&(form.desc.length>=10||docs.length>0)&&missingFields.length===0&&!busy&&!docBusy;
 
   const regexTriage=useMemo(()=>classifyIntakeRegex(effectiveDesc,form.dept),[effectiveDesc,form.dept]);
 
@@ -413,7 +490,14 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
       sla:triage.sla,slaHours:triage.slaHours,slaStatus:"On Track",desc:effectiveDesc,
       assigned:"Cockpit Queue",status:"Awaiting Triage",stage:"new",
       seeded:false,attach:docs.length,
-      workflow:[{label:"Submitted",done:true},{label:"Agent Analysis",active:true},{label:"Attorney Review"},{label:"Close"}],
+      requestTypeId:selectedReqType?selectedReqType.id:null,
+      // W3-3 — structured answers, keyed by IntakeRequestField.key.
+      requestFieldValues:selectedReqType&&Object.keys(fieldValues).length>0?fieldValues:null,
+      // A configured type's stage workflow becomes the ticket's visible
+      // steps ("Submitted" first, "Close" last stay implicit book-ends).
+      workflow:selectedReqType&&selectedReqType.stages.length>0
+        ?[{label:"Submitted",done:true},...selectedReqType.stages.map((s,i)=>({label:s,...(i===0?{active:true}:{})})),{label:"Close"}]
+        :[{label:"Submitted",done:true},{label:"Agent Analysis",active:true},{label:"Attorney Review"},{label:"Close"}],
       aiTriage:{category:triage.cat,riskFlag:`${triage.risk} — ${triage.note}`,suggestedAssignee:triage.team,estimatedHours:triage.hrs,similarMatters:Math.floor(Math.random()*40)+5,confidence:triage.conf,routingRule:`${triage.rule}: ${triage.cat}`,source:triage.source||"regex"},
       conversation:null,agentRecommendation:null,triagedBy:null,triagedAt:null,triagedAction:null,
     };
@@ -435,6 +519,7 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
     <div style={{display:"flex",gap:8}}>
       <div onClick={()=>window.location.reload()} style={{padding:"9px 16px",border:`1px solid ${C.br}`,color:C.t2,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase"}}>File Another</div>
       <div onClick={goToInbox} style={{padding:"9px 16px",background:C.cy,color:C.bg,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:600}}>→ Inbox</div>
+      {goToMyRequests&&<div onClick={goToMyRequests} style={{padding:"9px 16px",border:`1px solid ${C.gn}`,color:C.gn,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:600}}>Track it · My Requests</div>}
     </div>
   </div>;
 
@@ -443,7 +528,7 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
       <FormField label="Your Name" required>
         <input value={form.from} onChange={e=>setForm({...form,from:e.target.value})} placeholder="Jane Smith" style={inputStyle}/>
       </FormField>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+      <div style={{display:"grid",gridTemplateColumns:phone?"1fr":"1fr 1fr",gap:12}}>
         <FormField label="Department" required>
           <select value={form.dept} onChange={e=>setForm({...form,dept:e.target.value})} style={inputStyle}>
             {["Product","Engineering","Sales","HR","Finance","Procurement","Marketing","Operations","Legal","Executive"].map(d=><option key={d} value={d} style={{background:C.s1}}>{d}</option>)}
@@ -456,13 +541,29 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
         </FormField>
       </div>
       <FormField label="Request Type" required>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}}>
-          {["Contract Review","NDA Request","IP Question","Privacy Question","Trademark Check","Vendor Due Diligence","Contract Question","Legal Question — General","Other"].map(t=>{
-            const active=form.type===t;
-            return <div key={t} onClick={()=>setForm({...form,type:t})} style={{padding:"7px 8px",border:`1px solid ${active?C.cy:C.br}`,background:active?C.cy+"22":"transparent",cursor:"pointer",fontSize:10,fontFamily:M,letterSpacing:.5,color:active?C.cy:C.t2,textAlign:"center",transition:"all .12s"}}>{t}</div>;
-          })}
+        <div style={{display:"grid",gridTemplateColumns:phone?"repeat(2,1fr)":"repeat(3,1fr)",gap:6}}>
+          {(()=>{
+            const builtIn=["Contract Review","NDA Request","IP Question","Privacy Question","Trademark Check","Vendor Due Diligence","Contract Question","Legal Question — General","Other"];
+            // Configured workstreams merge in (deduped by name); they
+            // carry a ▣ marker so the demo can point at "that one is
+            // config, not code".
+            const configured=reqTypes.filter(rt=>!builtIn.includes(rt.name)).map(rt=>rt.name);
+            return [...builtIn,...configured].map(t=>{
+              const active=form.type===t;
+              const isConfigured=configured.includes(t);
+              return <div key={t} {...pressable(()=>setForm({...form,type:t}),`Request type: ${t}`)} aria-pressed={active} title={isConfigured?"Configured workstream (Request Types)":undefined} style={{padding:"7px 8px",border:`1px solid ${active?C.cy:C.br}`,background:active?C.cy+"22":"transparent",cursor:"pointer",fontSize:10,fontFamily:M,letterSpacing:.5,color:active?C.cy:isConfigured?C.tl:C.t2,textAlign:"center",transition:"all .12s"}}>{isConfigured?"▣ ":""}{t}</div>;
+            });
+          })()}
         </div>
+        {selectedReqType&&selectedReqType.stages.length>0&&<div style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:5,marginTop:7}}>
+          <span style={{fontSize:9,fontFamily:M,color:C.t4,letterSpacing:1,textTransform:"uppercase"}}>Workflow:</span>
+          {selectedReqType.stages.map((s,i)=><span key={i} style={{fontSize:9.5,fontFamily:M,color:C.t2,background:C.s2,borderRadius:3,padding:"2px 7px"}}>{i+1}. {s}</span>)}
+        </div>}
       </FormField>
+
+      {/* W3-3 — the selected type's configured fields render here;
+          answers persist structured AND feed the agent as context. */}
+      {selectedReqType&&<DynamicFields typeName={selectedReqType.name} fields={selectedReqType.fields} values={fieldValues} onChange={(k,v)=>setFieldValues(fv=>({...fv,[k]:v}))}/>}
       <FormField label="Describe your request" required sub="Be specific — regex + Claude triage and agent routing use this">
         <textarea value={form.desc} onChange={e=>setForm({...form,desc:e.target.value})} placeholder="E.g. Mutual NDA for discussions with Acme Corp — 2-year term, Delaware law." rows={5} style={{...inputStyle,resize:"vertical",fontFamily:F,minHeight:100}}/>
       </FormField>
@@ -475,7 +576,7 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
             {docBusy?"◎ Extracting…":"📎 Choose file"}
             <input type="file" accept=".docx,.txt,.text,.md,.pdf,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={onPickFile} disabled={docBusy} style={{display:"none"}}/>
           </label>
-          <span style={{fontSize:10,color:C.t4,fontFamily:M}}>Max 5 MB</span>
+          <span style={{fontSize:10,color:C.t4,fontFamily:M}}>Max {Math.round(uploadMode.maxBytes/1024/1024)} MB{uploadMode.mode==="direct"?" · original file retained":""}</span>
         </div>
         {docErr&&<div style={{marginTop:8,padding:8,background:C.rdG||C.s1,borderLeft:`2px solid ${C.rd}`,borderRadius:3,fontSize:10.5,color:C.rd,fontFamily:M}}>⚠ {docErr}</div>}
         {docs.length>0&&<div style={{display:"flex",flexDirection:"column",gap:5,marginTop:10}}>
@@ -487,8 +588,9 @@ function LegacyFormInner({store,initialType,initialDesc,goToInbox,settings}){
       </FormField>
 
       <div style={{display:"flex",gap:10,marginTop:16,flexWrap:"wrap"}}>
-        <div onClick={submit} style={{padding:"11px 22px",background:canSubmit?C.cy:C.br,color:canSubmit?C.bg:C.t4,fontSize:11,fontFamily:M,letterSpacing:1.8,cursor:canSubmit?"pointer":"not-allowed",textTransform:"uppercase",fontWeight:600}}>{busy?"◎ Triaging + Routing to Agent…":"→ Submit · Route to Agent"}</div>
+        <div {...(canSubmit?pressable(submit,"Submit request"):{"aria-disabled":true,role:"button",tabIndex:0})} style={{padding:"11px 22px",background:canSubmit?C.cy:C.br,color:canSubmit?C.bg:C.t4,fontSize:11,fontFamily:M,letterSpacing:1.8,cursor:canSubmit?"pointer":"not-allowed",textTransform:"uppercase",fontWeight:600}}>{busy?"◎ Triaging + Routing to Agent…":"→ Submit · Route to Agent"}</div>
       </div>
+      {missingFields.length>0&&<div style={{marginTop:8,fontSize:10,color:C.am,fontFamily:M}}>⚠ Required for {selectedReqType.name}: {missingFields.join(", ")}</div>}
       <div style={{marginTop:14,padding:11,background:C.s1,borderRadius:5,borderLeft:`2px solid ${C.em}`,fontSize:10.5,color:C.t2,fontFamily:M,lineHeight:1.55}}>
         <div style={{color:C.em,fontWeight:600,marginBottom:3,letterSpacing:.5}}>v8 FLOW</div>
         On submit: regex triage runs → ticket saved → agent router picks best fit → recommendation generated → ticket lands in Cockpit for attorney review. <span style={{color:C.am}}>Agents never auto-close.</span>
@@ -581,8 +683,8 @@ function AgentRecommendationPanel({ticket,rec,agent,editing,draftEdit,onDraftEdi
 
     {/* Action buttons — disabled during edit mode */}
     {!editing&&<div style={{display:"flex",gap:7,marginTop:14,flexWrap:"wrap"}}>
-      {action==="approve-and-send"&&<div onClick={onApprove} style={{padding:"9px 14px",background:C.gn,color:C.bg,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:700,display:"flex",alignItems:"center",gap:7}}><Kbd k="a" active/> Approve + Send</div>}
-      {action==="flag-for-review"&&<div onClick={onApprove} style={{padding:"9px 14px",background:C.am,color:C.bg,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:700,display:"flex",alignItems:"center",gap:7}}><Kbd k="a" active/> Approve as-is</div>}
+      {action==="approve-and-send"&&<div {...pressable(onApprove,"Approve and send")} style={{padding:"9px 14px",background:C.gn,color:C.bg,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:700,display:"flex",alignItems:"center",gap:7}}><Kbd k="a" active/> Approve + Send</div>}
+      {action==="flag-for-review"&&<div {...pressable(onApprove,"Approve as-is")} style={{padding:"9px 14px",background:C.am,color:C.bg,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:700,display:"flex",alignItems:"center",gap:7}}><Kbd k="a" active/> Approve as-is</div>}
       {action==="escalate"&&<div onClick={onEscalate} style={{padding:"9px 14px",background:C.rd,color:C.bone,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:700,display:"flex",alignItems:"center",gap:7}}><Kbd k="a" active/> Escalate</div>}
       {rec.draftedResponse&&<div onClick={onEdit} style={{padding:"9px 14px",border:`1px solid ${C.cy}`,color:C.cy,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:600,display:"flex",alignItems:"center",gap:7}}><Kbd k="e"/> Edit Draft</div>}
       <div onClick={onReject} style={{padding:"9px 14px",border:`1px solid ${C.rd}`,color:C.rd,fontSize:10,fontFamily:M,letterSpacing:1.5,cursor:"pointer",textTransform:"uppercase",fontWeight:600,display:"flex",alignItems:"center",gap:7}}><Kbd k="x"/> Reject</div>
@@ -823,6 +925,7 @@ function ReassignPicker({ticket,onPick,onCancel}){
 // CockpitTab — the main component
 // ══════════════════════════════════════════════════
 function CockpitTab({store,cockpit}){
+  const stacked=useIsNarrow(1024); // W4-3 — tablet: panels stack
   // Session-resolved attribution (Phase 1a). cockpit.state.attorney
   // is null on a fresh load; we fall back to the Auth0-resolved
   // user. The server is still authoritative on persisted audit rows
@@ -853,6 +956,7 @@ function CockpitTab({store,cockpit}){
   const[selected,setSelected]=useState([]);
   const[showBulkConfirm,setShowBulkConfirm]=useState(false);
   const[showReassign,setShowReassign]=useState(false);
+  const[showHandoff,setShowHandoff]=useState(false);
   const[search,setSearch]=useState("");
   const[showSearch,setShowSearch]=useState(false);
   const[toast,setToast]=useState(null);
@@ -1013,13 +1117,14 @@ function CockpitTab({store,cockpit}){
       else if(showSearch){ setShowSearch(false); setSearch(""); }
     },
     " ":bulkMode&&current?()=>toggleSelected(current.id):null,
-  },true);
+  },!showHandoff); // suspend shortcuts while the hand-off dialog is open
 
   const recAgent=current?.agentRecommendation?AGENTS_BY_ID[current.agentRecommendation.agentId]:null;
 
   return <div style={{position:"relative"}}>
     {showCheatsheet&&<ShortcutCheatsheet onClose={()=>setShowCheatsheet(false)}/>}
     {showReassign&&current&&<ReassignPicker ticket={current} onPick={pickAssignee} onCancel={()=>setShowReassign(false)}/>}
+    {showHandoff&&current&&<HandoffDialog ticket={current} onClose={()=>setShowHandoff(false)} onDone={(msg,tone)=>showToast(msg,tone)}/>}
     {showBulkConfirm&&<BulkConfirmCard selected={selected} tickets={visibleQueue} onConfirm={confirmBulkApprove} onCancel={()=>setShowBulkConfirm(false)}/>}
 
     {/* Cockpit header — status bar */}
@@ -1057,12 +1162,13 @@ function CockpitTab({store,cockpit}){
     </div>
 
     {/* Main view: ticket + right panels */}
-    {current?<div style={{display:"grid",gridTemplateColumns:"1.4fr 1fr",gap:14}}>
+    {current?<div style={{display:"grid",gridTemplateColumns:stacked?"1fr":"1.4fr 1fr",gap:14}}>
       <div>
         {bulkMode&&<div onClick={()=>toggleSelected(current.id)} style={{padding:"8px 12px",marginBottom:10,background:selected.includes(current.id)?C.gnG:C.s1,border:`1px solid ${selected.includes(current.id)?C.gn:C.br}`,borderRadius:4,cursor:"pointer",display:"flex",alignItems:"center",gap:10,fontSize:11,fontFamily:M,color:selected.includes(current.id)?C.gn:C.t2,letterSpacing:1,textTransform:"uppercase",fontWeight:600}}>
           <span style={{fontSize:14}}>{selected.includes(current.id)?"☑":"☐"}</span>
           <span>{selected.includes(current.id)?"selected for bulk":"press space to select"}</span>
         </div>}
+        <LitigationSummaryCard ticket={current}/>
         <TicketDetailPanel ticket={current}/>
       </div>
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -1081,6 +1187,8 @@ function CockpitTab({store,cockpit}){
           onCancelEdit={cancelEdit}
         />
         <SimilarMattersPanel currentTicket={current} allTickets={allTickets}/>
+        <PanelBoundary label="Work panel" compact><WorkPanel ticket={current}/></PanelBoundary>
+        <PanelBoundary label="Parties panel" compact><PartiesPanel ticket={current}/></PanelBoundary>
         <CapacityPanel allTickets={allTickets} attorney={attorney}/>
 
         {/* Secondary actions */}
@@ -1088,6 +1196,7 @@ function CockpitTab({store,cockpit}){
           <div style={{fontSize:9.5,fontFamily:M,color:C.t3,letterSpacing:1.5,textTransform:"uppercase",fontWeight:600,marginBottom:8}}>Other Actions</div>
           <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
             <div onClick={reassign} style={{padding:"6px 10px",background:C.s2,border:`1px solid ${C.br}`,borderRadius:3,cursor:"pointer",fontSize:10,fontFamily:M,color:C.t2,letterSpacing:.8,display:"flex",alignItems:"center",gap:6}}><Kbd k="r"/> Reassign</div>
+            <div onClick={()=>setShowHandoff(true)} title="Pass this ticket's baton — to a person, back to the agent, or to the queue" style={{padding:"6px 10px",background:C.s2,border:`1px solid ${C.br}`,borderRadius:3,cursor:"pointer",fontSize:10,fontFamily:M,color:C.t2,letterSpacing:.8,display:"flex",alignItems:"center",gap:6}}>⇄ Hand off</div>
             <div onClick={manualClose} style={{padding:"6px 10px",background:C.s2,border:`1px solid ${C.br}`,borderRadius:3,cursor:"pointer",fontSize:10,fontFamily:M,color:C.t2,letterSpacing:.8,display:"flex",alignItems:"center",gap:6}}><Kbd k="c"/> Manual Close</div>
             <div onClick={snooze} style={{padding:"6px 10px",background:C.s2,border:`1px solid ${C.br}`,borderRadius:3,cursor:"pointer",fontSize:10,fontFamily:M,color:C.t2,letterSpacing:.8,display:"flex",alignItems:"center",gap:6}}><Kbd k="s"/> Snooze</div>
             <div onClick={toggleBulk} style={{padding:"6px 10px",background:bulkMode?C.am+"22":C.s2,border:`1px solid ${bulkMode?C.am:C.br}`,borderRadius:3,cursor:"pointer",fontSize:10,fontFamily:M,color:bulkMode?C.am:C.t2,letterSpacing:.8,display:"flex",alignItems:"center",gap:6,fontWeight:bulkMode?600:400}}><Kbd k="b" active={bulkMode}/> Bulk</div>
@@ -1128,6 +1237,21 @@ function CockpitTab({store,cockpit}){
 
 function AgentSettingsPanel({onClose,settings,toggle,log}){
   const[tab,setTab]=useState("agents"); // "agents" | "log"
+
+  // W3-2 — the session user's outbound email notification toggles.
+  const[notifyPrefs,setNotifyPrefs]=useState(null);
+  useEffect(()=>{
+    let on=true;
+    fetch("/api/intake/notification-prefs").then(r=>r.ok?r.json():null)
+      .then(d=>{ if(on&&d?.prefs) setNotifyPrefs(d.prefs); }).catch(()=>{});
+    return()=>{ on=false; };
+  },[]);
+  const toggleNotify=(k)=>{
+    if(!notifyPrefs) return;
+    const next={...notifyPrefs,[k]:!notifyPrefs[k]};
+    setNotifyPrefs(next); // optimistic — the PUT is fire-and-forget
+    fetch("/api/intake/notification-prefs",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({prefs:next})}).catch(()=>{});
+  };
 
   // P2b — per-agent health metrics (produced / accept-rate / avg-conf /
   // degraded-rate, 7-day window) from /api/intake/agent-metrics. Keyed
@@ -1248,6 +1372,31 @@ function AgentSettingsPanel({onClose,settings,toggle,log}){
             })}
           </div>
 
+          {/* W3-2 — outbound email notification toggles (per user) */}
+          {notifyPrefs&&<div style={{marginTop:18}}>
+            <div style={{fontSize:9.5,fontFamily:M,color:C.t3,letterSpacing:1.5,textTransform:"uppercase",fontWeight:600,marginBottom:10}}>🔔 Email notifications (yours)</div>
+            {[
+              {k:"enabled",l:"Email notifications",d:"Master switch — off silences everything below."},
+              {k:"assignment",l:"Assigned to me",d:"A ticket lands on your plate (routing or reassignment)."},
+              {k:"stage",l:"My request moved forward",d:"A request you filed advanced a stage."},
+              {k:"breach",l:"SLA breach on my ticket",d:"A ticket assigned to you blew its SLA window."},
+              {k:"closure",l:"My request resolved",d:"A request you filed was closed."},
+            ].map(row=>{
+              const on=!!notifyPrefs[row.k];
+              const dimmed=row.k!=="enabled"&&!notifyPrefs.enabled;
+              return <div key={row.k} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 12px",background:C.s1,border:`1px solid ${C.br}`,borderRadius:4,marginBottom:5,opacity:dimmed?.45:1}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:11.5,color:C.t1,fontWeight:row.k==="enabled"?600:400}}>{row.l}</div>
+                  <div style={{fontSize:9.5,color:C.t3,fontFamily:M,marginTop:1}}>{row.d}</div>
+                </div>
+                <div onClick={()=>dimmed?null:toggleNotify(row.k)} style={{width:36,height:20,background:on&&!dimmed?C.gn:C.br,borderRadius:10,position:"relative",cursor:dimmed?"not-allowed":"pointer",transition:"background .15s",flexShrink:0}}>
+                  <div style={{width:16,height:16,background:on&&!dimmed?C.bg:C.t3,borderRadius:"50%",position:"absolute",top:2,left:on?18:2,transition:"left .15s"}}/>
+                </div>
+              </div>;
+            })}
+            <div style={{fontSize:9.5,color:C.t4,fontFamily:M,lineHeight:1.5}}>Delivery uses the org's intake mailbox (Admin → Mailboxes). Without one configured, notifications are recorded on the audit ledger but not emailed.</div>
+          </div>}
+
           <div style={{marginTop:16,padding:11,background:C.amG,borderLeft:`2px solid ${C.am}`,borderRadius:3,fontSize:10.5,color:C.t2,lineHeight:1.6,fontFamily:M}}>
             <span style={{color:C.am,fontWeight:600,letterSpacing:.5}}>v8 SAFETY RULE:</span> Agents <span style={{color:C.am,fontWeight:600}}>never auto-close tickets</span>. They produce recommendations. Every close is attorney-initiated, logged, and reversible.
           </div>
@@ -1295,8 +1444,13 @@ function LogRow({e}){
 // v7.2 Preserved Sub-tabs: Inbox + Detail
 // (Operate on v8 store — agent fields render gracefully when present)
 // ══════════════════════════════════════════════════
+const INBOX_PAGE_SIZE=60;
 function InboxTab({store,sel,setSel}){
+  const phone=useIsNarrow(640); // W4-3 — stat tiles reflow; table scrolls sideways
   const[flt,setFlt]=useState("all");
+  // W4-2 — windowed list render: rows mount in pages of 60 so a
+  // many-hundreds inbox stays instant. Filters reset the window.
+  const[visibleCount,setVisibleCount]=useState(INBOX_PAGE_SIZE);
   // "My Queue" (P1b) — tickets whose typed assignee FK is the
   // session user. The FK is set by the Cockpit's reassign picker and
   // the seed; free-text `assigned` doesn't count (it's display-only
@@ -1325,11 +1479,12 @@ function InboxTab({store,sel,setSel}){
     {id:"new",l:"New (You)",n:tickets.filter(FILTER_PREDICATES.new).length,c:C.pp},
   ];
   const filtered=tickets.filter(FILTER_PREDICATES[flt]||FILTER_PREDICATES.all);
+  const visible=filtered.slice(0,visibleCount);
 
   if(req) return <IntakeDetail req={req} store={store} onBack={()=>setSel(null)}/>;
 
   return <div>
-    <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:14}}>
+    <div style={{display:"grid",gridTemplateColumns:phone?"repeat(2,1fr)":"repeat(5,1fr)",gap:10,marginBottom:14}}>
       {[{l:"Today's Requests",v:tickets.length,c:C.bl},
         {l:"Auto-Resolved",v:tickets.filter(r=>r.status==="Auto-Completed").length,c:C.gn,sub:tickets.length?Math.round(tickets.filter(r=>r.status==="Auto-Completed").length/tickets.length*100)+"% deflection":"—"},
         {l:"In Flight",v:tickets.filter(r=>r.stage==="review"||r.stage==="assigned").length,c:C.tl},
@@ -1345,15 +1500,18 @@ function InboxTab({store,sel,setSel}){
     <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
       {filters.map(f=>{
         const active=flt===f.id;
-        return <div key={f.id} onClick={()=>setFlt(f.id)} style={{padding:"5px 11px",border:`1px solid ${active?f.c:C.br}`,background:active?f.c+"18":"transparent",cursor:"pointer",transition:"all .15s",fontFamily:M,fontSize:10,letterSpacing:1,textTransform:"uppercase",color:active?f.c:C.t2}}>{f.l} <span style={{color:C.t3,marginLeft:4}}>{f.n}</span></div>;
+        return <div key={f.id} {...pressable(()=>{setFlt(f.id);setVisibleCount(INBOX_PAGE_SIZE);},`Filter: ${f.l}`)} aria-pressed={active} style={{padding:"5px 11px",border:`1px solid ${active?f.c:C.br}`,background:active?f.c+"18":"transparent",cursor:"pointer",transition:"all .15s",fontFamily:M,fontSize:10,letterSpacing:1,textTransform:"uppercase",color:active?f.c:C.t2}}>{f.l} <span style={{color:C.t3,marginLeft:4}}>{f.n}</span></div>;
       })}
     </div>
 
     <Card>
+      {/* W4-3 — the table keeps its columns and scrolls sideways inside
+          its own container on narrow screens (never squishes). */}
+      <div style={{overflowX:"auto"}}><div style={{minWidth:860}}>
       <div style={{display:"grid",gridTemplateColumns:"75px 115px 95px 1fr 70px 130px 85px 95px",padding:"8px 10px",fontSize:9,fontWeight:600,color:C.t3,letterSpacing:1.2,textTransform:"uppercase",fontFamily:M,borderBottom:`1px solid ${C.br}`}}>
         <span>ID</span><span>Requester</span><span>Type</span><span>Description</span><span>Priority</span><span>SLA</span><span>Status</span><span>Assignee</span>
       </div>
-      {filtered.length===0?<div style={{padding:"40px 10px",textAlign:"center",color:C.t4,fontSize:11,fontFamily:M}}>No tickets match this filter.</div>:filtered.map((r,i)=><div key={r.id} onClick={()=>setSel(r.id)} style={{display:"grid",gridTemplateColumns:"75px 115px 95px 1fr 70px 130px 85px 95px",padding:"10px 10px",borderBottom:`1px solid ${C.br}22`,cursor:"pointer",animation:`fu .25s ease ${i*25}ms both`,fontSize:11,alignItems:"center",background:r.slaStatus==="Overdue"?C.rdG:r.slaStatus==="At Risk"?C.amG:"transparent",transition:"background .12s"}} onMouseEnter={e=>e.currentTarget.style.background=C.cdH} onMouseLeave={e=>e.currentTarget.style.background=r.slaStatus==="Overdue"?C.rdG:r.slaStatus==="At Risk"?C.amG:"transparent"}>
+      {filtered.length===0?<div style={{padding:"40px 10px",textAlign:"center",color:C.t4,fontSize:11,fontFamily:M}}>No tickets match this filter.</div>:visible.map((r,i)=><div key={r.id} {...pressable(()=>setSel(r.id),`Open ticket ${r.id}: ${r.type}, ${r.priority} priority, ${r.slaStatus}`)} style={{display:"grid",gridTemplateColumns:"75px 115px 95px 1fr 70px 130px 85px 95px",padding:"10px 10px",borderBottom:`1px solid ${C.br}22`,cursor:"pointer",animation:`fu .25s ease ${Math.min(i*25,500)}ms both`,fontSize:11,alignItems:"center",background:r.slaStatus==="Overdue"?C.rdG:r.slaStatus==="At Risk"?C.amG:"transparent",transition:"background .12s"}} onMouseEnter={e=>e.currentTarget.style.background=C.cdH} onMouseLeave={e=>e.currentTarget.style.background=r.slaStatus==="Overdue"?C.rdG:r.slaStatus==="At Risk"?C.amG:"transparent"}>
         <span style={{fontFamily:M,color:r.seeded?C.cy:C.pp,fontWeight:600,fontSize:10}}>{r.id}</span>
         <div><div style={{color:C.t1,fontWeight:500,fontSize:11}}>{r.from}</div><div style={{color:C.t4,fontSize:9}}>{r.dept}</div></div>
         <Pill t={r.type} c={C.pp}/>
@@ -1363,21 +1521,28 @@ function InboxTab({store,sel,setSel}){
         <Pill t={r.status} c={r.status==="Auto-Completed"?C.gn:r.status.includes("Escalated")?C.rd:r.status==="Triage"?C.am:C.tl}/>
         <span style={{fontSize:9.5,color:C.t3}}>{r.assigned}</span>
       </div>)}
+      {filtered.length>visibleCount&&<div {...pressable(()=>setVisibleCount(c=>c+INBOX_PAGE_SIZE),"Show more tickets")} style={{padding:"12px 10px",textAlign:"center",cursor:"pointer",fontSize:10,fontFamily:M,letterSpacing:1.2,color:C.cy,textTransform:"uppercase",borderTop:`1px solid ${C.br}`}} onMouseEnter={e=>e.currentTarget.style.background=C.cdH} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>▾ Show more · {filtered.length-visibleCount} remaining</div>}
+      </div></div>
     </Card>
   </div>;
 }
 
 // ── Detail view (with working quick-actions) ─────────
 function IntakeDetail({req,store,onBack}){
-  const advance=()=>{
-    const stages=["new","triage","assigned","review","complete"];
-    const idx=stages.indexOf(req.stage);
-    if(idx<stages.length-1){
-      const nextStage=stages[idx+1];
-      const wf=req.workflow.map((s,i)=>i<=idx+1?{...s,done:i<=idx,active:i===idx+1&&nextStage!=="complete"}:{...s,done:false,active:false});
-      if(nextStage==="complete") wf.forEach(s=>{s.done=true;s.active=false});
-      store.updateTicket(req.id,{stage:nextStage,status:nextStage==="complete"?"Completed":nextStage==="review"?"In Review":nextStage==="assigned"?"Assigned":"Triage",workflow:wf});
-    }
+  const toast=useToast();
+  const phone=useIsNarrow(760); // W4-3 — panels stack on phones
+  // W1-5 — server-enforced stage advancement (audited + timestamped).
+  // The endpoint owns the transition; the local store syncs from the
+  // response so the polyfill persists the same values (one codepath
+  // for the display-status mapping).
+  const advance=async()=>{
+    try{
+      const r=await fetch(`/api/intake/tickets/${encodeURIComponent(req.id)}/advance-stage`,{method:"POST"});
+      const d=await r.json().catch(()=>({}));
+      if(r.status===409) return; // already at final stage — button is a no-op
+      if(!r.ok||!d.ok) throw new Error(d.error||`Advance failed (HTTP ${r.status})`);
+      store.updateTicket(req.id,{stage:d.stage,...(d.status?{status:d.status}:{}),workflow:d.workflow});
+    }catch(e){ toast.error(String(e.message||e)); }
   };
   const escalate=()=>{
     store.updateTicket(req.id,{status:"Escalated to GC",priority:"Critical",assigned:"Mark Williams, GC + "+req.assigned});
@@ -1388,7 +1553,7 @@ function IntakeDetail({req,store,onBack}){
   };
 
   return <div>
-    <div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:4,cursor:"pointer",fontSize:11,color:C.cy,marginBottom:12,padding:"3px 6px",fontFamily:M,letterSpacing:1}} onMouseEnter={e=>e.currentTarget.style.background=C.cy+"18"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>← Back to Inbox</div>
+    <div {...pressable(onBack,"Back to inbox")} style={{display:"inline-flex",alignItems:"center",gap:4,cursor:"pointer",fontSize:11,color:C.cy,marginBottom:12,padding:"3px 6px",fontFamily:M,letterSpacing:1}} onMouseEnter={e=>e.currentTarget.style.background=C.cy+"18"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>← Back to Inbox</div>
 
     <div style={{background:C.cd,border:`1px solid ${C.br}`,borderLeft:`3px solid ${pc(req.priority)}`,padding:18,marginBottom:14}}>
       <div style={{display:"flex",justifyContent:"space-between",gap:20}}>
@@ -1398,10 +1563,16 @@ function IntakeDetail({req,store,onBack}){
             <Pill t={req.priority} c={pc(req.priority)}/>
             <Pill t={req.type} c={C.pp}/>
             <Pill t={req.status} c={req.status==="Auto-Completed"||req.status==="Completed"?C.gn:req.status.includes("Escalated")?C.rd:C.tl}/>
+            {/* W2-2 — who holds the baton right now (auto-populated by the agent pipeline) */}
+            {req.handoffHolder&&<Pill t={req.handoffHolder==="agent"?"🤖 WITH AGENT":req.handoffHolder==="human"?"HELD · HUMAN":"IN QUEUE"} c={req.handoffHolder==="agent"?C.pp:req.handoffHolder==="human"?C.cy:C.t3}/>}
+            {/* W2-5 — only the named approver can ship agent output on this ticket */}
+            {req.approvalGateUserId&&<span title={`Only ${req.approvalGateUserName||"the designated approver"} can approve agent recommendations on this ticket (routing-rule approval gate).`}><Pill t={`🔒 APPROVAL: ${(req.approvalGateUserName||"designated approver").toUpperCase()}`} c={C.am}/></span>}
             {!req.seeded&&<Pill t="YOU CREATED" c={C.pp}/>}
           </div>
           <div style={{fontSize:16,fontWeight:400,color:C.t1,fontFamily:SR,lineHeight:1.35,marginBottom:8}}>{req.desc}</div>
           <div style={{fontSize:11,color:C.t3,fontFamily:M}}>From <span style={{color:C.t1}}>{req.from}</span> · {req.dept} · Submitted {req.submitted} · Assigned to <span style={{color:C.tl}}>{req.assigned}</span></div>
+          {/* W3-3 — structured answers captured by the type's configured fields */}
+          <RequestFieldValues values={req.requestFieldValues}/>
         </div>
         <div style={{textAlign:"right",minWidth:130}}>
           <div style={{fontSize:9,color:C.t3,textTransform:"uppercase",letterSpacing:1.5,fontFamily:M,marginBottom:4}}>SLA {req.slaStatus}</div>
@@ -1416,13 +1587,19 @@ function IntakeDetail({req,store,onBack}){
     <div style={{fontSize:11,fontWeight:600,color:C.cy,marginBottom:6,letterSpacing:1,textTransform:"uppercase",fontFamily:M}}>Request Workflow</div>
     <WorkflowSteps steps={req.workflow}/>
 
-    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:14,marginTop:14}}>
+    {/* W2-4 — one SLA window, partitioned by custody (issue #111) */}
+    <PanelBoundary label="SLA custody legs" compact><SlaLegsPanel ticketId={req.id}/></PanelBoundary>
+
+    {/* W1-3 — the whole story as one verifiable chain (issue #105) */}
+    <PanelBoundary label="Ticket timeline" compact><TicketTimelinePanel ticketId={req.id}/></PanelBoundary>
+
+    <div style={{display:"grid",gridTemplateColumns:phone?"1fr":"2fr 1fr",gap:14,marginTop:14}}>
       <Card d={100}>
         <div style={{fontSize:11,fontWeight:600,color:C.tl,marginBottom:10,letterSpacing:1.2,fontFamily:M,textTransform:"uppercase",display:"flex",justifyContent:"space-between"}}>
-          <span>◎ AI Triage Analysis</span>
+          <span>◎ AI Triage Analysis{req.aiTriage.complexity&&<span style={{marginLeft:8,fontSize:8.5,fontFamily:M,letterSpacing:1,padding:"2px 7px",borderRadius:3,textTransform:"uppercase",color:req.aiTriage.complexity==="complex"?C.rd:req.aiTriage.complexity==="simple"?C.gn:C.am,border:`1px solid ${req.aiTriage.complexity==="complex"?C.rd:req.aiTriage.complexity==="simple"?C.gn:C.am}55`}}>{req.aiTriage.complexity}</span>}</span>
           <span style={{fontSize:9,color:req.aiTriage.source==="claude"?C.em:C.t4,fontFamily:M,letterSpacing:1}}>{req.aiTriage.source==="claude"?"CLAUDE LLM":req.aiTriage.source==="regex"?"REGEX CLASSIFIER":"FALLBACK"}</span>
         </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10,marginBottom:12}}>
+        <div style={{display:"grid",gridTemplateColumns:phone?"repeat(2,1fr)":"1fr 1fr 1fr 1fr",gap:10,marginBottom:12}}>
           <div style={{padding:10,background:C.s1,borderRadius:5}}><div style={{fontSize:9,color:C.t3,textTransform:"uppercase",letterSpacing:.8,fontWeight:600,marginBottom:3,fontFamily:M}}>Category</div><div style={{fontSize:11.5,fontWeight:600,color:C.t1}}>{req.aiTriage.category}</div></div>
           <div style={{padding:10,background:C.s1,borderRadius:5}}><div style={{fontSize:9,color:C.t3,textTransform:"uppercase",letterSpacing:.8,fontWeight:600,marginBottom:3,fontFamily:M}}>Est Hours</div><div style={{fontSize:20,fontWeight:400,color:C.tl,fontFamily:SR}}>{req.aiTriage.estimatedHours}</div></div>
           <div style={{padding:10,background:C.s1,borderRadius:5}}><div style={{fontSize:9,color:C.t3,textTransform:"uppercase",letterSpacing:.8,fontWeight:600,marginBottom:3,fontFamily:M}}>Similar</div><div style={{fontSize:20,fontWeight:400,color:C.bl,fontFamily:SR}}>{req.aiTriage.similarMatters||"—"}</div></div>
@@ -1444,7 +1621,7 @@ function IntakeDetail({req,store,onBack}){
           {l:req.stage==="complete"?"✓ Completed":"Advance Stage",c:C.bl,i:"→",fn:advance,disabled:req.stage==="complete"},
           {l:"Escalate to GC",c:C.rd,i:"⚡",fn:escalate,disabled:req.status==="Escalated to GC"},
           {l:"Mark Complete",c:C.gn,i:"✓",fn:complete,disabled:req.stage==="complete"},
-        ].map((a,i)=><div key={i} onClick={a.disabled?null:a.fn} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 11px",background:C.s1,borderRadius:4,cursor:a.disabled?"not-allowed":"pointer",marginBottom:6,border:`1px solid ${C.br}`,transition:"all .15s",opacity:a.disabled?.4:1}} onMouseEnter={e=>{if(a.disabled)return;e.currentTarget.style.borderColor=a.c;e.currentTarget.style.background=a.c+"18"}} onMouseLeave={e=>{e.currentTarget.style.borderColor=C.br;e.currentTarget.style.background=C.s1}}>
+        ].map((a,i)=><div key={i} {...(a.disabled?{"aria-disabled":true}:pressable(a.fn,a.l))} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 11px",background:C.s1,borderRadius:4,cursor:a.disabled?"not-allowed":"pointer",marginBottom:6,border:`1px solid ${C.br}`,transition:"all .15s",opacity:a.disabled?.4:1}} onMouseEnter={e=>{if(a.disabled)return;e.currentTarget.style.borderColor=a.c;e.currentTarget.style.background=a.c+"18"}} onMouseLeave={e=>{e.currentTarget.style.borderColor=C.br;e.currentTarget.style.background=C.s1}}>
           <span style={{fontSize:13,color:a.c,width:18,textAlign:"center"}}>{a.i}</span>
           <span style={{fontSize:11,color:C.t1,flex:1}}>{a.l}</span>
         </div>)}
@@ -1499,7 +1676,8 @@ function KanbanTab({store}){
       </div>
     </div>
 
-    <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,height:"calc(100vh - 330px)",minHeight:520}}>
+    <div style={{overflowX:"auto"}}>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(190px,1fr))",gap:10,height:"calc(100vh - 330px)",minHeight:520,minWidth:990}}>
       {stages.map((stage,si)=>{
         const col=tickets.filter(it=>it.stage===stage.id);
         return <div key={stage.id} onDragOver={e=>e.preventDefault()} onDrop={()=>onDrop(stage.id)} style={{background:C.s1,border:`1px solid ${C.br}`,borderTop:`3px solid ${stage.c}`,borderRadius:"0 0 6px 6px",display:"flex",flexDirection:"column",overflow:"hidden",animation:`fu .25s ease ${si*50}ms both`}}>
@@ -1533,6 +1711,7 @@ function KanbanTab({store}){
           </div>
         </div>;
       })}
+    </div>
     </div>
   </div>;
 }
@@ -1747,14 +1926,26 @@ function RoutingRuleEditor({initial,assignees,onCancel,onSaved}){
   const[matchPriority,setMatchPriority]=useState(initial?.matchPriority||"");
   const[matchDepartment,setMatchDepartment]=useState(initial?.matchDepartment||"");
   const[matchKeyword,setMatchKeyword]=useState(initial?.matchKeyword||"");
+  const[matchComplexity,setMatchComplexity]=useState(initial?.matchComplexity||"");
   const[setAssigneeUserId,setSetAssigneeUserId]=useState(initial?.setAssigneeUserId||"");
   const[setPriority,setSetPriority]=useState(initial?.setPriority||"");
   const[setSlaHours,setSetSlaHours]=useState(initial?.setSlaHours??"");
+  const[setTeamId,setSetTeamId]=useState(initial?.setTeamId||"");
+  const[escalateToUserId,setEscalateToUserId]=useState(initial?.escalateToUserId||"");
+  const[requireApprovalFromUserId,setRequireApprovalFromUserId]=useState(initial?.requireApprovalFromUserId||"");
+  const[pools,setPools]=useState([]);
   const[saving,setSaving]=useState(false);
   const[error,setError]=useState(null);
 
-  const hasCondition=matchType||matchPriority||matchDepartment||matchKeyword;
-  const hasAction=setAssigneeUserId||setPriority||setSlaHours!=="";
+  // Route-to-pool option (item 5). Active pools only.
+  useEffect(()=>{
+    let on=true;
+    fetch("/api/admin/intake/teams").then(r=>r.json()).then(d=>{ if(on) setPools((d.teams||[]).filter(t=>t.active)); }).catch(()=>{});
+    return()=>{on=false;};
+  },[]);
+
+  const hasCondition=matchType||matchPriority||matchDepartment||matchKeyword||matchComplexity;
+  const hasAction=setAssigneeUserId||setPriority||setSlaHours!==""||setTeamId||escalateToUserId||requireApprovalFromUserId;
   const canSave=name.trim().length>0&&hasCondition&&hasAction&&!saving;
 
   const submit=async()=>{
@@ -1768,9 +1959,13 @@ function RoutingRuleEditor({initial,assignees,onCancel,onSaved}){
       matchPriority:matchPriority||null,
       matchDepartment:matchDepartment.trim()||null,
       matchKeyword:matchKeyword.trim()||null,
+      matchComplexity:matchComplexity||null,
       setAssigneeUserId:setAssigneeUserId||null,
       setPriority:setPriority||null,
       setSlaHours:setSlaHours===""?null:Number(setSlaHours),
+      setTeamId:setTeamId||null,
+      escalateToUserId:escalateToUserId||null,
+      requireApprovalFromUserId:requireApprovalFromUserId||null,
     };
     try{
       const resp=await fetch(isCreate?"/api/intake/routing-rules":`/api/intake/routing-rules/${initial.id}`,{
@@ -1834,6 +2029,10 @@ function RoutingRuleEditor({initial,assignees,onCancel,onSaved}){
           {fieldLabel("Keyword in description")}
           <input value={matchKeyword} onChange={e=>setMatchKeyword(e.target.value)} placeholder="(any)" style={{...inputStyle,width:"100%",fontSize:11}}/>
         </div>
+        <div>
+          {fieldLabel("Complexity (from AI triage)")}
+          {select(matchComplexity,setMatchComplexity,[{value:"simple",label:"Simple — template-fit, low risk"},{value:"standard",label:"Standard"},{value:"complex",label:"Complex — high risk / heavy effort"}])}
+        </div>
       </div>
       {!hasCondition&&<div style={{fontSize:10,color:C.am,fontFamily:M,marginBottom:8}}>⚠ Set at least one condition or the rule would match everything.</div>}
 
@@ -1843,6 +2042,11 @@ function RoutingRuleEditor({initial,assignees,onCancel,onSaved}){
           {fieldLabel("Reassign to")}
           {select(setAssigneeUserId,setSetAssigneeUserId,(assignees||[]).map(a=>({value:a.id,label:`${a.name} · ${a.roleName||"user"}`})),"(don't reassign)")}
         </div>
+        <div style={{gridColumn:"1 / span 2"}}>
+          {fieldLabel("Or route to pool (load-balanced)")}
+          {select(setTeamId,setSetTeamId,pools.map(p=>({value:p.id,label:`${p.name} · ${p.strategy==="round_robin"?"round robin":"least loaded"} · ${p.members.length} member${p.members.length===1?"":"s"}`})),"(don't route to a pool)")}
+          {setAssigneeUserId&&setTeamId&&<div style={{fontSize:9.5,color:C.am,fontFamily:M,marginTop:3}}>⚠ A direct assignee wins over the pool — clear one.</div>}
+        </div>
         <div>
           {fieldLabel("Set priority to")}
           {select(setPriority,setSetPriority,ROUTING_EDITOR_PRIORITIES,"(don't change)")}
@@ -1850,6 +2054,14 @@ function RoutingRuleEditor({initial,assignees,onCancel,onSaved}){
         <div>
           {fieldLabel("Set SLA (hours)")}
           <input type="number" min="1" value={setSlaHours} onChange={e=>setSetSlaHours(e.target.value)} placeholder="(don't change)" style={{...inputStyle,width:"100%",fontSize:11}}/>
+        </div>
+        <div style={{gridColumn:"1 / span 2"}}>
+          {fieldLabel("Escalate to (assign + raise to Critical + mark Escalated)")}
+          {select(escalateToUserId,setEscalateToUserId,(assignees||[]).map(a=>({value:a.id,label:`${a.name} · ${a.roleName||"user"}`})),"(don't escalate)")}
+        </div>
+        <div style={{gridColumn:"1 / span 2"}}>
+          {fieldLabel("Require approval from (only they can approve agent output)")}
+          {select(requireApprovalFromUserId,setRequireApprovalFromUserId,(assignees||[]).map(a=>({value:a.id,label:`${a.name} · ${a.roleName||"user"}`})),"(no approval gate)")}
         </div>
       </div>
       {!hasAction&&<div style={{fontSize:10,color:C.am,fontFamily:M,marginBottom:8}}>⚠ Set at least one action or the rule will be a no-op.</div>}
@@ -1913,13 +2125,17 @@ function ruleConditionText(r){
   if(r.matchPriority) conds.push(`priority = ${r.matchPriority}`);
   if(r.matchDepartment) conds.push(`department = ${r.matchDepartment}`);
   if(r.matchKeyword) conds.push(`description contains "${r.matchKeyword}"`);
+  if(r.matchComplexity) conds.push(`complexity = ${r.matchComplexity}`);
   return conds.length?conds.join(" AND "):"(matches everything)";
 }
 function ruleActionText(r){
   const acts=[];
   if(r.setPriority) acts.push(`priority → ${r.setPriority}`);
   if(r.setSlaHours!=null) acts.push(`SLA → ${r.setSlaHours}h`);
+  if(r.escalateToUserId) acts.push(`escalate → ${r.escalateToName||"(user)"}`);
   if(r.setAssigneeUserId) acts.push(`assign → ${r.assigneeName||"(user)"}`);
+  else if(r.setTeamId) acts.push(`route to pool → ${r.teamName||"(pool)"}`);
+  if(r.requireApprovalFromUserId) acts.push(`approval gate → ${r.approverName||"(user)"}`);
   return acts.join(" · ")||"(no actions)";
 }
 
@@ -2074,6 +2290,7 @@ function RoutingTab({rules,loading,error,onRuleUpdated,onRuleCreated,onRuleDelet
 // itself; FAQ activity comes from /api/intake/agent-metrics. No
 // fabricated resolution / deflection numbers.
 function SelfServeTab({onFileTicket}){
+  const phone=useIsNarrow(640); // W4-3 — tiles reflow on phones
   const[q,setQ]=useState("");
   const[catFilter,setCatFilter]=useState(null);
   const[sel,setSel]=useState(null);
@@ -2108,7 +2325,7 @@ function SelfServeTab({onFileTicket}){
   const fmt=v=>faqMetric===undefined?"…":(v==null?"—":v);
 
   return <div>
-    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+    <div style={{display:"grid",gridTemplateColumns:phone?"repeat(2,1fr)":"repeat(4,1fr)",gap:10,marginBottom:14}}>
       {[
         {l:"KB Articles",v:SELF_SERVE_ARTICLES.length,c:C.tl,sub:"From the legal playbook"},
         {l:"Categories",v:SELF_SERVE_CATEGORIES.length,c:C.pp,sub:"Coverage areas"},
@@ -2197,6 +2414,28 @@ export function IntakeView(){
   const[routingAssignees,setRoutingAssignees]=useState([]);
   const routingSession=useCurrentUser();
   const canManageRouting=routingSession?.has?.("admin:manage_users")||false;
+
+  // W1-1 — staff land on My Work by default (one screen per persona).
+  // Applies once, after the session resolves, and only if the user
+  // hasn't already navigated away from the initial default.
+  const defaultTabApplied=useRef(false);
+  useEffect(()=>{
+    if(defaultTabApplied.current||!routingSession?.user) return;
+    defaultTabApplied.current=true;
+    const staff=routingSession.has?.("intake:read_all_tickets");
+    const requesterTabs=["new","myrequests","selfserve"];
+    setTab(t=>{
+      if(t==="cockpit") return staff?"mywork":"myrequests"; // untouched default
+      if(!staff&&!requesterTabs.includes(t)) return "myrequests"; // hidden for this role
+      return t;
+    });
+  },[routingSession]);
+
+  // Deep link from My Work rows into the ticket (Inbox drill-in).
+  const openTicketById=useCallback((id)=>{
+    setSel(id); // Inbox sel is the ticket ID; IntakeDetail resolves it.
+    setTab("inbox");
+  },[]);
   useEffect(()=>{
     let mounted=true;
     fetch("/api/intake/routing-rules")
@@ -2219,13 +2458,33 @@ export function IntakeView(){
     setRoutingRules(prev=>prev?prev.filter(r=>r.id!==id):prev);
   },[]);
 
-  const tabs=[
+  // W1-4 — role-shaped navigation (issue #106). Requesters see only
+  // their three surfaces; staff see Work | File | Insights groups
+  // (thin dividers); admin config appends behind its own divider.
+  // While the session resolves we show the staff set (sans admin) so
+  // the majority persona never sees a layout flash.
+  const isStaffNav=routingSession?.user?routingSession.has?.("intake:read_all_tickets"):true;
+  const tabs=isStaffNav?[
+    {id:"mywork",label:"My Work",icon:"☰"},
     {id:"inbox",label:"Inbox",icon:"◉"},
-    {id:"new",label:"New Request",icon:"＋",v8:true},
     {id:"cockpit",label:"Triage Cockpit",icon:"⌘",v8:true},
     {id:"kanban",label:"Kanban",icon:"◱"},
+    {divider:true},
+    {id:"new",label:"New Request",icon:"＋",v8:true},
+    {id:"myrequests",label:"My Requests",icon:"◍"},
+    {id:"selfserve",label:"Self-Service",icon:"◈",count:SELF_SERVE_ARTICLES.length},
+    {divider:true},
     {id:"sla",label:"SLA Dashboard",icon:"◔"},
+    {id:"poolops",label:"Pool Ops",icon:"⛁"},
     {id:"routing",label:"Smart Routing",icon:"⚯",count:routingRules?routingRules.length:undefined},
+    ...(canManageRouting?[
+      {divider:true},
+      {id:"teams",label:"Teams",icon:"◪"},
+      {id:"request-types",label:"Request Types",icon:"❏"},
+    ]:[]),
+  ]:[
+    {id:"new",label:"New Request",icon:"＋",v8:true},
+    {id:"myrequests",label:"My Requests",icon:"◍"},
     {id:"selfserve",label:"Self-Service",icon:"◈",count:SELF_SERVE_ARTICLES.length},
   ];
 
@@ -2253,29 +2512,40 @@ export function IntakeView(){
       </div>
     </div>
 
-    {/* Tab bar */}
-    <div style={{display:"flex",gap:2,marginBottom:14,borderBottom:`1px solid ${C.br}`,overflowX:"auto",flexWrap:"wrap"}}>
-      {tabs.map(t=>{
+    {/* Tab bar — W4-4: a nav landmark; every tab is focusable and
+        Enter/Space-operable; the active one carries aria-current. */}
+    <nav aria-label="Intake sections" style={{display:"flex",gap:2,marginBottom:14,borderBottom:`1px solid ${C.br}`,overflowX:"auto",flexWrap:"wrap"}}>
+      {tabs.map((t,ti)=>{
+        if(t.divider) return <div key={`div-${ti}`} aria-hidden="true" style={{width:1,alignSelf:"stretch",background:C.br,margin:"7px 5px"}}/>;
         const active=tab===t.id;
-        return <div key={t.id} onClick={()=>{setTab(t.id);setSel(null)}} style={{padding:"8px 14px",borderBottom:`2px solid ${active?C.cy:"transparent"}`,cursor:"pointer",transition:"all .15s",fontFamily:M,fontSize:10.5,letterSpacing:1.2,textTransform:"uppercase",color:active?C.cy:C.t3,fontWeight:active?600:400,display:"flex",alignItems:"center",gap:6,marginBottom:-1,whiteSpace:"nowrap"}} onMouseEnter={e=>{if(!active)e.currentTarget.style.color=C.t1}} onMouseLeave={e=>{if(!active)e.currentTarget.style.color=C.t3}}>
+        return <div key={t.id} {...pressable(()=>{setTab(t.id);setSel(null)},`${t.label} section`)} aria-current={active?"page":undefined} style={{padding:"8px 14px",borderBottom:`2px solid ${active?C.cy:"transparent"}`,cursor:"pointer",transition:"all .15s",fontFamily:M,fontSize:10.5,letterSpacing:1.2,textTransform:"uppercase",color:active?C.cy:C.t3,fontWeight:active?600:400,display:"flex",alignItems:"center",gap:6,marginBottom:-1,whiteSpace:"nowrap"}} onMouseEnter={e=>{if(!active)e.currentTarget.style.color=C.t1}} onMouseLeave={e=>{if(!active)e.currentTarget.style.color=C.t3}}>
           <span style={{fontSize:12}}>{t.icon}</span>{t.label}
           {t.v8&&<Pill t="v8" c={C.em}/>}
           {t.count!==undefined&&<span style={{fontSize:9,padding:"1px 5px",background:active?C.cy+"22":C.br+"44",color:active?C.cy:C.t3,borderRadius:2,fontFamily:M}}>{t.count}</span>}
           {t.id==="cockpit"&&awaiting>0&&<span style={{fontSize:9,color:C.am,fontFamily:M,fontWeight:700}}>·{awaiting}</span>}
         </div>;
       })}
-    </div>
+    </nav>
 
-    {/* v8 tabs */}
+    {/* v8 tabs — one boundary around the whole region (key resets it
+        on tab switch) so a crashed tab degrades to a contained fallback
+        while the nav + header keep working (W4-1). */}
+    <PanelBoundary key={tab} label={`The ${tab} view`}>
+    {tab==="mywork"&&<MyWorkTab onOpenTicket={openTicketById} userName={routingSession?.user?.name}/>}
+    {tab==="myrequests"&&<MyRequestsTab onFileNew={()=>setTab("new")}/>}
     {tab==="cockpit"&&<CockpitTab store={store} cockpit={cockpit}/>}
-    {tab==="new"&&<NewRequestV8 store={store} goToInbox={()=>setTab("inbox")} goToCockpit={()=>setTab("cockpit")} settings={agentSettingsHook.settings} prefillDesc={prefillDesc}/>}
+    {tab==="new"&&<NewRequestV8 store={store} goToInbox={()=>setTab("inbox")} goToCockpit={()=>setTab("cockpit")} goToMyRequests={()=>setTab("myrequests")} settings={agentSettingsHook.settings} prefillDesc={prefillDesc}/>}
 
     {/* v7.2 preserved tabs */}
     {tab==="inbox"&&<InboxTab store={store} sel={sel} setSel={setSel}/>}
     {tab==="kanban"&&<KanbanTab store={store}/>}
     {tab==="sla"&&<SLATab store={store}/>}
+    {tab==="poolops"&&<PoolOpsTab/>}
     {tab==="routing"&&<RoutingTab rules={routingRules} loading={routingRules===null&&!routingError} error={routingError} onRuleUpdated={onRuleUpdated} onRuleCreated={onRuleCreated} onRuleDeleted={onRuleDeleted} assignees={routingAssignees} canManage={canManageRouting}/>}
+    {tab==="teams"&&<TeamsTab canManage={canManageRouting}/>}
+    {tab==="request-types"&&<RequestTypesTab canManage={canManageRouting}/>}
     {tab==="selfserve"&&<SelfServeTab onFileTicket={(draft)=>{setPrefillDesc(draft||"");setTab("new");}}/>}
+    </PanelBoundary>
   </div>;
 }
 
