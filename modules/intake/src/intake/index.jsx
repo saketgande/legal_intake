@@ -387,6 +387,7 @@ function fileToBase64(file){
 function LegacyFormInner({store,initialType,initialDesc,goToInbox,goToMyRequests,settings}){
   // Session-resolved default for the requester `from` field. Same
   // pattern as CopilotChat: pre-fill, leave editable. Phase 1a.
+  const phone=useIsNarrow(640); // W4-3 — single-column form on phones
   const{user:sessionUser}=useCurrentUser();
   const[form,setForm]=useState({from:"",dept:"Product",type:initialType||"Contract Review",desc:initialDesc||"",attach:0,urgency:"Standard"});
   useEffect(()=>{
